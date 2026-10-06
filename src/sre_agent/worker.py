@@ -1,0 +1,148 @@
+"""Queue worker. It discovers and records incidents. It does not repair unless a separate executor is configured."""
+
+from __future__ import annotations
+
+import json
+import os
+
+from sre_agent.clock import SystemClock
+from sre_agent.models import AgentConfig
+from sre_agent.service import OperationsAgent
+
+
+def handler(event, context) -> dict:
+    del context
+    agent = build_agent()
+    for record in event.get("Records") or []:
+        body = json.loads(record.get("body") or "{}")
+        if body.get("type") in {"reconcile", "monitor", "verify", "refresh", "investigate"}:
+            agent.queue.send(body)
+        else:
+            agent.accept_event(body)
+    if not event.get("Records"):
+        agent.queue.send({"type": "reconcile"})
+    handled = agent.process_queue()
+    _emit_agent_metrics(agent)
+    return {"handled": handled}
+
+
+def build_agent() -> OperationsAgent:
+    from sre_agent.aws.boto3_reader import Boto3Reader
+    from sre_agent.discovery.service import AccountTarget, Scope
+    from sre_agent.registry.store import Boto3TableAdapter, Registry
+
+    region = os.environ.get("SRE_REGION", "us-east-2")
+    account_id = os.environ["SRE_ACCOUNT_ID"]
+    reader = Boto3Reader(
+        role_arn=os.environ.get("SRE_DISCOVERY_ROLE_ARN") or None,
+        region=region,
+        explorer_view_arn=os.environ.get("SRE_EXPLORER_VIEW_ARN") or None,
+        order_table=os.environ.get("SRE_ORDER_TABLE") or None,
+    )
+    scope = Scope(
+        accounts=[
+            AccountTarget(
+                account_id=account_id,
+                regions=[region],
+                reader=reader,
+                enable_resource_explorer=bool(os.environ.get("SRE_EXPLORER_VIEW_ARN")),
+                enable_config=os.environ.get("SRE_ENABLE_CONFIG") == "true",
+            )
+        ]
+    )
+    table_name = os.environ["SRE_REGISTRY_TABLE"]
+    import boto3
+
+    registry = Registry(Boto3TableAdapter(boto3.resource("dynamodb").Table(table_name)))
+    mode = os.environ.get("SRE_MODE", "recommend")
+    approval_mode = os.environ.get("SRE_APPROVAL_MODE", "required")
+    targets = frozenset(item for item in os.environ.get("LAB_TARGETS", "").split(",") if item)
+    config = AgentConfig(
+        mode=mode,
+        enabled_automatic_runbooks=frozenset(["sqs.redrive_dlq"]) if mode == "automatic" else frozenset(),
+        lab_targets=targets,
+        require_approval=os.environ.get("SRE_REQUIRE_APPROVAL", "true") == "true" or approval_mode == "required",
+        approvers=frozenset(item for item in os.environ.get("SRE_APPROVERS", "").split(",") if item),
+        approval_mode=approval_mode,
+        jira_issue_type=os.environ.get("JIRA_ISSUE_TYPE", "Task"),
+        jira_transition=os.environ.get("JIRA_TRANSITION", "Done"),
+    )
+    confluence = _confluence()
+    jira = _jira()
+    # Repairs go to a separate executor Lambda. This worker does not assume that role.
+    repair_queue = _repair_sender()
+    return OperationsAgent(
+        scope,
+        registry,
+        SystemClock(),
+        config,
+        confluence=confluence,
+        jira=jira,
+        repair_queue=repair_queue,
+    )
+
+
+def _confluence():
+    from sre_agent.integrations.confluence import HttpConfluence
+    from sre_agent.integrations.secrets import secret_value
+
+    base = os.environ.get("CONFLUENCE_BASE_URL", "")
+    page = os.environ.get("CONFLUENCE_PAGE_ID", "")
+    email = os.environ.get("CONFLUENCE_EMAIL", "")
+    token = secret_value("CONFLUENCE_TOKEN", "CONFLUENCE_SECRET_ARN")
+    if not (base and page and email and token):
+        return None
+    return HttpConfluence(base, page, email, token)
+
+
+def _jira():
+    from sre_agent.integrations.jira import HttpJira
+    from sre_agent.integrations.secrets import secret_value
+
+    base = os.environ.get("JIRA_BASE_URL", "")
+    project = os.environ.get("JIRA_PROJECT", "")
+    email = os.environ.get("JIRA_EMAIL", "")
+    token = secret_value("JIRA_TOKEN", "JIRA_SECRET_ARN")
+    if not (base and project and email and token):
+        return None
+    return HttpJira(
+        base,
+        project,
+        email,
+        token,
+        transition_name=os.environ.get("JIRA_TRANSITION", "Done"),
+        issue_type=os.environ.get("JIRA_ISSUE_TYPE", "Task"),
+    )
+
+
+def _repair_sender():
+    queue_url = os.environ.get("SRE_EXECUTOR_QUEUE_URL", "")
+    if not queue_url:
+        return None
+
+    def send(body: dict, queue_url: str = queue_url) -> None:
+        import boto3
+
+        boto3.client("sqs").send_message(QueueUrl=queue_url, MessageBody=json.dumps(body))
+
+    return send
+
+
+def _emit_agent_metrics(agent: OperationsAgent) -> None:
+    try:
+        import boto3
+    except ImportError:
+        return
+    catalog_failed = 1 if agent.catalog_status == "failed" else 0
+    jira_failed = 1 if any(item.collector == "jira" and item.status == "error" for item in agent.registry.scans()) else 0
+    try:
+        boto3.client("cloudwatch").put_metric_data(
+            Namespace="SRE/Agent",
+            MetricData=[
+                {"MetricName": "CatalogLoadFailed", "Value": catalog_failed, "Unit": "Count"},
+                {"MetricName": "JiraSyncFailed", "Value": jira_failed, "Unit": "Count"},
+                {"MetricName": "QueueBacklog", "Value": len(agent.queue.pending()), "Unit": "Count"},
+            ],
+        )
+    except Exception:
+        return

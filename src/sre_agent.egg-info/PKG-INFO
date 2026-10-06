@@ -1,0 +1,48 @@
+Metadata-Version: 2.4
+Name: sre-agent
+Version: 0.1.0
+Summary: Discover existing AWS resources, monitor them, diagnose failures, and run gated repairs.
+Requires-Python: >=3.11
+Description-Content-Type: text/markdown
+Provides-Extra: aws
+Requires-Dist: boto3>=1.34; extra == "aws"
+
+# SRE agent
+
+The agent starts from resources that already exist.
+
+```text
+discover → registry → monitor → diagnose → policy gate → repair → verify
+```
+
+Terraform may have created some of those resources. This project does not assume that, and it does not import them just to watch them. Terraform state, when you have it, adds intended configuration and ownership. It is not a complete inventory. Terraform in `terraform/` deploys the agent itself: the registry table, the work queue, the discovery, diagnosis, and executor roles, the hourly reconciliation rule, and the alarm that says discovery work is stuck.
+
+## Run the first version
+
+```powershell
+pip install -e .
+pytest
+python -m sre_agent demo
+python -m sre_agent lab
+```
+
+`demo` inventories a local account and stops at a recommendation. `lab` validates the one repair, `sqs.redrive_dlq`, including the cases where it must not run. The lab never points at live AWS.
+
+A live read, still in recommendation mode:
+
+```powershell
+pip install boto3
+python -m sre_agent inventory --account 123456789012 --region us-east-1
+```
+
+## What the first version does
+
+1. Scan one account and one Region for Lambda, SQS, and EC2. Pagination and throttling are retried. A denied call is recorded and is not treated as an empty result. Global services are called out as not scanned.
+2. Upsert a registry record by account, Region, type, and stable id. Optional sources are Resource Explorer, AWS Config, Terraform state, and an SNS registration message. SNS is not required.
+3. A successful list that no longer sees a resource marks it uncertain. Only a direct lookup that returns not found marks it deleted.
+4. Attach a monitoring pack for Lambda, SQS, and EC2. Anything else stays visible as discovered, monitoring unsupported. Missing required telemetry is unknown, not healthy.
+5. Diagnose with six read-only tools. Rules decide the action. An explanation hook cannot change it.
+6. The policy gate defaults to recommendation. The only validated automatic repair is redriving an SQS dead-letter queue after transient failures, and only after you enable it. A failing consumer, poison messages, and a Terraform-owned configuration change are refused.
+7. Verification reads telemetry after the repair. A successful API call is not recovery. A failed recovery cancels a still-running move when it can, records the lesson, and blocks a repeat.
+
+The application map stores the evidence for each relationship, so a queue backlog whose consumer is failing is not treated as a redrive.
