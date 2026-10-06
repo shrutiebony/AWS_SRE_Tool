@@ -56,6 +56,8 @@ def build_agent() -> OperationsAgent:
     registry = Registry(Boto3TableAdapter(boto3.resource("dynamodb").Table(table_name)))
     mode = os.environ.get("SRE_MODE", "recommend")
     approval_mode = os.environ.get("SRE_APPROVAL_MODE", "required")
+    from sre_agent.integrations.secrets import secret_value
+
     targets = frozenset(item for item in os.environ.get("LAB_TARGETS", "").split(",") if item)
     config = AgentConfig(
         mode=mode,
@@ -64,8 +66,8 @@ def build_agent() -> OperationsAgent:
         require_approval=os.environ.get("SRE_REQUIRE_APPROVAL", "true") == "true" or approval_mode == "required",
         approvers=frozenset(item for item in os.environ.get("SRE_APPROVERS", "").split(",") if item),
         approval_mode=approval_mode,
-        jira_issue_type=os.environ.get("JIRA_ISSUE_TYPE", "Task"),
-        jira_transition=os.environ.get("JIRA_TRANSITION", "Done"),
+        jira_issue_type=secret_value("JIRA_ISSUE_TYPE", "JIRA_SECRET_ARN") or "Task",
+        jira_transition=secret_value("JIRA_TRANSITION", "JIRA_SECRET_ARN") or "Done",
     )
     confluence = _confluence()
     jira = _jira()
@@ -86,9 +88,9 @@ def _confluence():
     from sre_agent.integrations.confluence import HttpConfluence
     from sre_agent.integrations.secrets import secret_value
 
-    base = os.environ.get("CONFLUENCE_BASE_URL", "")
-    page = os.environ.get("CONFLUENCE_PAGE_ID", "")
-    email = os.environ.get("CONFLUENCE_EMAIL", "")
+    base = secret_value("CONFLUENCE_BASE_URL", "CONFLUENCE_SECRET_ARN")
+    page = secret_value("CONFLUENCE_PAGE_ID", "CONFLUENCE_SECRET_ARN")
+    email = secret_value("CONFLUENCE_EMAIL", "CONFLUENCE_SECRET_ARN")
     token = secret_value("CONFLUENCE_TOKEN", "CONFLUENCE_SECRET_ARN")
     if not (base and page and email and token):
         return None
@@ -99,9 +101,9 @@ def _jira():
     from sre_agent.integrations.jira import HttpJira
     from sre_agent.integrations.secrets import secret_value
 
-    base = os.environ.get("JIRA_BASE_URL", "")
-    project = os.environ.get("JIRA_PROJECT", "")
-    email = os.environ.get("JIRA_EMAIL", "")
+    base = secret_value("JIRA_BASE_URL", "JIRA_SECRET_ARN")
+    project = secret_value("JIRA_PROJECT", "JIRA_SECRET_ARN")
+    email = secret_value("JIRA_EMAIL", "JIRA_SECRET_ARN")
     token = secret_value("JIRA_TOKEN", "JIRA_SECRET_ARN")
     if not (base and project and email and token):
         return None
@@ -110,8 +112,8 @@ def _jira():
         project,
         email,
         token,
-        transition_name=os.environ.get("JIRA_TRANSITION", "Done"),
-        issue_type=os.environ.get("JIRA_ISSUE_TYPE", "Task"),
+        transition_name=secret_value("JIRA_TRANSITION", "JIRA_SECRET_ARN") or "Done",
+        issue_type=secret_value("JIRA_ISSUE_TYPE", "JIRA_SECRET_ARN") or "Task",
     )
 
 

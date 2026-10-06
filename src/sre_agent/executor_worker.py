@@ -52,6 +52,8 @@ def build_executor():
     import boto3
 
     registry = Registry(Boto3TableAdapter(boto3.resource("dynamodb").Table(os.environ["SRE_REGISTRY_TABLE"])))
+    from sre_agent.integrations.secrets import secret_value
+
     approval_mode = os.environ.get("SRE_APPROVAL_MODE", "required")
     targets = frozenset(item for item in os.environ.get("LAB_TARGETS", "").split(",") if item)
     config = AgentConfig(
@@ -61,8 +63,8 @@ def build_executor():
         require_approval=os.environ.get("SRE_REQUIRE_APPROVAL", "true") == "true" or approval_mode == "required",
         approvers=frozenset(item for item in os.environ.get("SRE_APPROVERS", "").split(",") if item),
         approval_mode=approval_mode,
-        jira_issue_type=os.environ.get("JIRA_ISSUE_TYPE", "Task"),
-        jira_transition=os.environ.get("JIRA_TRANSITION", "Done"),
+        jira_issue_type=secret_value("JIRA_ISSUE_TYPE", "JIRA_SECRET_ARN") or "Task",
+        jira_transition=secret_value("JIRA_TRANSITION", "JIRA_SECRET_ARN") or "Done",
     )
 
     def mutator(account_id: str, reader=reader):

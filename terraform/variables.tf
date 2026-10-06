@@ -41,50 +41,50 @@ variable "lab_kms_key_arns" {
 
 variable "confluence_secret_arn" {
   type        = string
-  description = "Secrets Manager ARN for the Confluence API token."
+  description = "Secrets Manager ARN for the Atlassian connection used to read Confluence. Default is empty, so the Lambda receives this ARN only when the operator sets the variable. A JSON secret may include token (or api_token or password), base_url or site, email, confluence_page_id, jira_project, jira_issue_type, and jira_transition. When jira_secret_arn is empty, Jira uses this secret too."
   default     = ""
 }
 
 variable "jira_secret_arn" {
   type        = string
-  description = "Secrets Manager ARN for the Jira API token."
+  description = "Secrets Manager ARN for the Atlassian connection used to update Jira. Default is empty, so the Lambda receives this ARN only when the operator sets the variable. When this is empty and confluence_secret_arn is set, Jira uses that secret."
   default     = ""
 }
 
 variable "confluence_base_url" {
   type        = string
-  description = "Atlassian site origin. The client appends /wiki/api/v2/pages/{id}."
-  default     = "https://sjsu-team-lpan6pj6.atlassian.net"
+  description = "Optional override for the Atlassian site origin. The client appends /wiki/api/v2/pages/{id}. Empty uses base_url or site from the Secrets Manager JSON."
+  default     = ""
 }
 
 variable "confluence_page_id" {
   type        = string
-  description = "AWS failure scenario catalog page."
-  default     = "360481"
+  description = "Optional override for the Confluence catalog page id. Empty uses confluence_page_id from the Secrets Manager JSON."
+  default     = ""
 }
 
 variable "confluence_email" {
   type        = string
-  description = "Atlassian account email that can read the catalog page."
-  default     = "shruti.goyal@sjsu.edu"
+  description = "Optional override for the Atlassian account email. Empty uses email from the Secrets Manager JSON."
+  default     = ""
 }
 
 variable "jira_base_url" {
   type        = string
-  description = "Atlassian site origin. The client calls /rest/api/3 on this host."
-  default     = "https://sjsu-team-lpan6pj6.atlassian.net"
+  description = "Optional override for the Jira site origin. The client calls /rest/api/3 on this host. Empty uses base_url or site from the Secrets Manager JSON."
+  default     = ""
 }
 
 variable "jira_project" {
   type        = string
-  description = "Jira project key for incidents."
-  default     = "KAN"
+  description = "Optional override for the Jira project key. Empty uses jira_project from the Secrets Manager JSON."
+  default     = ""
 }
 
 variable "jira_email" {
   type        = string
-  description = "Atlassian account email that can create issues in the Jira project."
-  default     = "shruti.goyal@sjsu.edu"
+  description = "Optional override for the Atlassian account email used with Jira. Empty uses email from the Secrets Manager JSON."
+  default     = ""
 }
 
 variable "order_table_name" {
@@ -141,8 +141,8 @@ variable "approver_account_ids" {
 
 variable "jira_issue_type" {
   type        = string
-  description = "Jira issue type created for an incident. KAN provides Task, not Incident."
-  default     = "Task"
+  description = "Optional override for the Jira issue type. Empty uses jira_issue_type from the secret. When the secret and the environment both omit it, the agent uses Task."
+  default     = ""
 }
 
 variable "jira_transition" {
