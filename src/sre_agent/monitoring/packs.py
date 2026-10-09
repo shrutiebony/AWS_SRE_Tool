@@ -65,6 +65,7 @@ def assess(record: ResourceRecord, signals: dict[str, float | None], context: di
         state="unknown",
         reasons=["No monitoring pack is registered for this resource type."],
         missing_signals=missing,
+        context={"pack": "none"},
     )
 
 

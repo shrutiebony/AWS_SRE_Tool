@@ -19,6 +19,7 @@ from sre_agent.discovery.collectors import (
     collect_queues,
     collect_rest_apis,
     collect_tables,
+    collect_watched,
     record_from_detail,
     relationships_for_detail,
 )
@@ -49,6 +50,7 @@ class DiscoveryReconciliationService:
         self.scope = scope
         self.registry = registry
         self.clock = clock
+        self.watched: list = []
 
     def run(self) -> list[CollectorResult]:
         results = self.scan()
@@ -119,6 +121,18 @@ class DiscoveryReconciliationService:
                 results.append(
                     self._note(collect_rest_apis(account.reader, account.account_id, region, seen_at, self.scope.page_size))
                 )
+                for watched in self.watched:
+                    results.append(
+                        self._note(
+                            collect_watched(
+                                account.reader,
+                                account.account_id,
+                                region,
+                                seen_at,
+                                watched.resource_type,
+                            )
+                        )
+                    )
             results.append(
                 self._note(
                     CollectorResult(

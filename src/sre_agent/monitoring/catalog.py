@@ -10,8 +10,9 @@ from sre_agent.models import HealthAssessment
 
 
 def apply_catalog(assessment: HealthAssessment, rules: list[CatalogRule], record, reader, start, end) -> HealthAssessment:
-    reasons = list(assessment.reasons)
-    state = assessment.state
+    catalog_only = assessment.context.get("pack") == "none"
+    reasons = [] if catalog_only else list(assessment.reasons)
+    state = "healthy" if catalog_only else assessment.state
     observed = dict(assessment.observed_signals)
     missing = list(assessment.missing_signals)
     matched = []
@@ -23,6 +24,8 @@ def apply_catalog(assessment: HealthAssessment, rules: list[CatalogRule], record
         except ConfluenceError as exc:
             state = "unknown"
             reasons.append(f"Catalog rule {rule.rule_id} has an unresolved placeholder: {exc}")
+    if catalog_only and not matched:
+        return assessment
     for rule in matched:
         try:
             value, detail = _measure(rule, record, reader, start, end)
@@ -58,14 +61,31 @@ def _measure(rule: CatalogRule, record, reader, start, end) -> tuple[float | Non
     if rule.statistic == "Expression":
         names = _names(rule.expression)
         raw = reader.get_metric_data(
-            record.account_id, record.region, record.resource_id, names, start, end, stat="Sum", period=period
+            record.account_id,
+            record.region,
+            record.resource_id,
+            names,
+            start,
+            end,
+            stat="Sum",
+            period=period,
+            namespace=rule.namespace or None,
+            dimensions=_dimensions(rule.dimension),
         )
         values = {name: aggregate_points(raw.get(name, []), "Sum", period) for name in names}
         if any(value is None for value in values.values()):
             return None, ""
         return metric_math(rule.expression, {name: float(value) for name, value in values.items()}), rule.expression
     if rule.log_query:
-        rows = reader.run_logs_query(record.account_id, record.region, record.resource_id, rule.log_query, start, end)
+        rows = reader.run_logs_query(
+            record.account_id,
+            record.region,
+            record.resource_id,
+            rule.log_query,
+            start,
+            end,
+            log_group=rule.namespace or None,
+        )
         return interpret_log_rows(rows, rule.statistic), rule.log_query
     raw = reader.get_metric_data(
         record.account_id,
@@ -76,6 +96,8 @@ def _measure(rule: CatalogRule, record, reader, start, end) -> tuple[float | Non
         end,
         stat=rule.statistic,
         period=period,
+        namespace=rule.namespace or None,
+        dimensions=_dimensions(rule.dimension),
     )
     return aggregate_points(raw.get(rule.signal, []), rule.statistic, period), f"{rule.statistic} over {period}s"
 
@@ -189,6 +211,18 @@ def _worse(current: str, new: str) -> str:
     if current not in rank:
         return new
     return new if rank[new] > rank[current] else current
+
+
+def _dimensions(text: str) -> list[dict[str, str]] | None:
+    if not text.strip():
+        return None
+    dimensions = []
+    for part in text.split(","):
+        name, separator, value = part.partition("=")
+        if not separator or not name.strip() or not value.strip():
+            raise CloudError(f"Dimension {text} must look like Name={{name}}")
+        dimensions.append({"Name": name.strip(), "Value": value.strip()})
+    return dimensions
 
 
 def _placeholders(record) -> dict[str, str]:

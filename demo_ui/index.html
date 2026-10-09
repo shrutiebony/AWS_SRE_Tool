@@ -1,0 +1,346 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SRE health checker</title>
+  <style>
+    :root {
+      --paper: #f4efe6;
+      --ink: #14201b;
+      --muted: #3d4a44;
+      --card: #fffdf8;
+      --line: #ddd3c3;
+      --green: #0c5c4a;
+      --green-deep: #083d32;
+      --sand: #efe4d2;
+      --rust: #8a3228;
+      --ok: #e4f3eb;
+      --bad: #f8e7e3;
+      --shadow: 0 30px 80px rgba(20, 32, 27, 0.18);
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; min-height: 100%; }
+    body {
+      font-family: "Segoe UI", "Helvetica Neue", sans-serif;
+      color: var(--ink);
+      background:
+        radial-gradient(900px 420px at 0% -10%, #efe2cc 0%, transparent 55%),
+        radial-gradient(700px 380px at 100% 0%, #e4efe8 0%, transparent 50%),
+        var(--paper);
+      font-size: 20px;
+      line-height: 1.45;
+    }
+    .page { min-height: 100vh; padding: 36px 48px 48px; display: flex; flex-direction: column; }
+    header { display: flex; justify-content: space-between; align-items: flex-start; gap: 24px; }
+    .eyebrow { letter-spacing: 0.16em; text-transform: uppercase; font-size: 14px; color: var(--green); font-weight: 700; margin: 0 0 10px; }
+    h1 { font-family: "Palatino Linotype", Palatino, Georgia, serif; font-size: clamp(48px, 6vw, 76px); line-height: 0.95; font-weight: 500; margin: 0; letter-spacing: -0.03em; }
+    .lede { max-width: 720px; font-size: 22px; color: var(--muted); margin: 16px 0 0; }
+    .banner { margin-top: 22px; padding: 14px 18px; border-radius: 16px; background: var(--sand); color: var(--ink); font-size: 17px; max-width: 980px; }
+    .banner strong { font-weight: 700; }
+    .grid { margin-top: 36px; display: grid; grid-template-columns: repeat(3, 1fr); gap: 22px; flex: 1; }
+    .card { background: var(--card); border: 1px solid var(--line); border-radius: 28px; padding: 28px 28px 24px; display: flex; flex-direction: column; min-height: 360px; box-shadow: 0 10px 30px rgba(20, 32, 27, 0.04); }
+    .card .num { font-family: "Palatino Linotype", Palatino, Georgia, serif; font-size: 42px; color: var(--green); margin: 0; }
+    .card h2 { font-size: 32px; line-height: 1.1; margin: 12px 0 12px; font-weight: 650; letter-spacing: -0.02em; }
+    .card p { margin: 0; color: var(--muted); flex: 1; font-size: 20px; }
+    button { font: inherit; cursor: pointer; border: 0; }
+    button:focus-visible { outline: 3px solid var(--ink); outline-offset: 3px; }
+    .begin, .primary { background: var(--green); color: white; border-radius: 999px; min-height: 60px; padding: 0 26px; font-size: 20px; font-weight: 650; }
+    .begin:hover, .primary:hover { background: var(--green-deep); }
+    .begin { align-self: flex-start; margin-top: 22px; }
+    .ghost { background: transparent; color: var(--ink); border-radius: 999px; min-height: 60px; padding: 0 22px; border: 1px solid var(--line); }
+    .reset { background: white; border: 1px solid var(--line); border-radius: 999px; min-height: 52px; padding: 0 20px; font-size: 17px; }
+    footer { margin-top: 28px; color: var(--muted); font-size: 16px; }
+    .overlay { position: fixed; inset: 0; background: rgba(16, 24, 20, 0.46); display: none; align-items: center; justify-content: center; padding: 28px; }
+    .overlay.open { display: flex; }
+    .modal { width: min(760px, 100%); background: var(--card); color: var(--ink); border-radius: 32px; padding: 40px 42px 32px; box-shadow: var(--shadow); }
+    .kicker { margin: 0 0 8px; letter-spacing: 0.14em; text-transform: uppercase; font-size: 13px; font-weight: 700; color: var(--green); }
+    .modal h2 { font-family: "Palatino Linotype", Palatino, Georgia, serif; font-size: 42px; line-height: 1.05; margin: 0 0 16px; font-weight: 500; }
+    .narration { font-size: 24px; margin: 0 0 22px; }
+    .facts { display: grid; gap: 10px; margin: 0 0 18px; }
+    .fact { display: grid; grid-template-columns: 160px 1fr; gap: 12px; padding: 12px 14px; background: var(--sand); border-radius: 14px; }
+    .fact span { color: var(--muted); font-size: 15px; letter-spacing: 0.04em; text-transform: uppercase; padding-top: 4px; }
+    .fact strong { font-size: 22px; font-weight: 650; word-break: break-word; }
+    .mail { border-radius: 16px; padding: 14px 16px; font-size: 18px; margin: 0 0 22px; }
+    .mail.sent { background: var(--ok); }
+    .mail.failed { background: var(--bad); }
+    .mail.quiet { background: var(--sand); }
+    .note { font-size: 18px; color: var(--muted); margin: 0 0 18px; }
+    .actions { display: flex; justify-content: flex-end; gap: 12px; }
+    .bar { height: 8px; border-radius: 99px; background: #e7dfd2; overflow: hidden; margin: 8px 0 0; }
+    .bar i { display: block; height: 100%; width: 40%; background: var(--green); border-radius: 99px; animation: slide 1.4s ease-in-out infinite; }
+    @keyframes slide { 0% { transform: translateX(-120%); } 100% { transform: translateX(320%); } }
+    @media (max-width: 980px) {
+      .page { padding: 24px; }
+      .grid { grid-template-columns: 1fr; }
+      h1 { font-size: 46px; }
+      .modal { padding: 28px 22px; }
+      .modal h2 { font-size: 34px; }
+      .fact { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <header>
+      <div>
+        <p class="eyebrow">Live demo · us-east-2</p>
+        <h1>SRE health checker</h1>
+        <p class="lede">Three stories, told by clicking. Each result opens here, with the live reading and whether the mail went out.</p>
+        <div class="banner" id="banner">Checking the catalog and mail path…</div>
+      </div>
+      <button class="reset" id="reset" type="button">Reset / clean</button>
+    </header>
+    <div class="grid">
+      <article class="card">
+        <p class="num">01</p>
+        <h2>Addition and deletion</h2>
+        <p>Create a DynamoDB table the checker has never seen, then delete it and watch it leave the inventory.</p>
+        <button class="begin" type="button" data-flow="add">Begin</button>
+      </article>
+      <article class="card">
+        <p class="num">02</p>
+        <h2>Failure, then the close</h2>
+        <p>Break the directory function so a KAN task opens. Restore it healthy with the task still open. The lab shows the close.</p>
+        <button class="begin" type="button" data-flow="fail">Begin</button>
+      </article>
+      <article class="card">
+        <p class="num">03</p>
+        <h2>A new service type</h2>
+        <p>An SNS topic from the Confluence page, with no code change. EKS uses the same heading and needs a real cluster.</p>
+        <button class="begin" type="button" data-flow="service">Begin</button>
+      </article>
+    </div>
+    <footer>Account 414279120882 · recommend mode · repairs off · inventory can take a few minutes and this page stays on the step that is running.</footer>
+  </div>
+  <div class="overlay" id="overlay">
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+      <p class="kicker" id="modal-kicker"></p>
+      <h2 id="modal-title"></h2>
+      <p class="narration" id="modal-narration"></p>
+      <div class="facts" id="modal-facts" hidden></div>
+      <p class="note" id="modal-note" hidden></p>
+      <div class="mail" id="modal-mail" hidden></div>
+      <div class="bar" id="modal-bar" hidden><i></i></div>
+      <div class="actions">
+        <button class="ghost" id="modal-close" type="button">Close</button>
+        <button class="primary" id="modal-next" type="button">Next</button>
+      </div>
+    </div>
+  </div>
+  <script>
+    const FLOWS = {
+      add: {
+        name: "Addition and deletion",
+        stages: [
+          { title: "Add a table", narration: "This creates demo-extra-sites in us-east-2 and asks the checker to inventory the account.", button: "Create the table", action: "demo1_create" },
+          { title: "Delete the table", narration: "This deletes only demo-extra-sites and inventories again.", button: "Delete and scan", action: "demo1_delete" }
+        ]
+      },
+      fail: {
+        name: "Failure, then the close",
+        stages: [
+          { title: "Break the directory", narration: "This points enterprise-sites-directory at a missing table so the sites API starts failing.", button: "Break the function", action: "demo2_break" },
+          { title: "Restore the directory", narration: "This puts TABLE_NAME back to enterprise-sites. The live checker stays in recommend mode, so the task is not closed.", button: "Restore and scan", action: "demo2_restore" },
+          { title: "Show the close in the lab", narration: "The live checker will not close that task. The lab walks the simulated close on a fake account.", button: "Run the lab", action: "demo2_lab" }
+        ]
+      },
+      service: {
+        name: "A new service type",
+        stages: [
+          { title: "A service from the page", narration: "This creates the SNS topic demo-alerts. The Confluence heading is enough, with no code change. EKS uses the same shape, Service: EKS (eks:cluster), and needs a real cluster.", button: "Create the topic", action: "demo3_create" }
+        ]
+      }
+    };
+    const resetStage = { title: "Clean the account", narration: "This restores the directory table name and deletes demo-extra-sites and demo-alerts if they are still here. It does not touch enterprise-sites.", button: "Clean up", action: "reset" };
+
+    const overlay = document.getElementById("overlay");
+    const kicker = document.getElementById("modal-kicker");
+    const title = document.getElementById("modal-title");
+    const narration = document.getElementById("modal-narration");
+    const facts = document.getElementById("modal-facts");
+    const note = document.getElementById("modal-note");
+    const mail = document.getElementById("modal-mail");
+    const bar = document.getElementById("modal-bar");
+    const closeBtn = document.getElementById("modal-close");
+    const nextBtn = document.getElementById("modal-next");
+
+    let flow = null;
+    let stageIndex = 0;
+    let mode = "intro";
+    let walk = null;
+    let walkIndex = 0;
+    let pollTimer = null;
+
+    function show(open) { overlay.classList.toggle("open", open); }
+    function setFacts(items) {
+      facts.innerHTML = "";
+      if (!items || !items.length) { facts.hidden = true; return; }
+      facts.hidden = false;
+      for (const item of items) {
+        const row = document.createElement("div");
+        row.className = "fact";
+        const label = document.createElement("span");
+        label.textContent = item.label;
+        const value = document.createElement("strong");
+        value.textContent = item.value;
+        row.append(label, value);
+        facts.append(row);
+      }
+    }
+    function setNote(text) {
+      note.hidden = !text;
+      note.textContent = text || "";
+    }
+    function setMail(info, force) {
+      if (!info) { mail.hidden = true; return; }
+      mail.hidden = false;
+      mail.className = "mail";
+      if (info.detail && info.detail.startsWith("Reset does not")) {
+        mail.classList.add("quiet");
+        mail.textContent = "Cleanup does not send mail.";
+        return;
+      }
+      if (info.sent) {
+        mail.classList.add("sent");
+        mail.textContent = "Mail was sent to shruti.goyal@sjsu.edu. " + info.detail;
+      } else {
+        mail.classList.add("failed");
+        mail.textContent = "Mail was not sent. " + info.detail;
+      }
+      if (force === false) mail.hidden = true;
+    }
+    function showIntro(stage, index, total, flowName) {
+      mode = "intro";
+      walk = null;
+      kicker.textContent = flowName + " · step " + (index + 1) + " of " + total;
+      title.textContent = stage.title;
+      narration.textContent = stage.narration;
+      setFacts([]);
+      setNote("");
+      setMail(null);
+      bar.hidden = true;
+      closeBtn.hidden = false;
+      nextBtn.hidden = false;
+      nextBtn.textContent = stage.button;
+      nextBtn.focus();
+      show(true);
+    }
+    function showProgress(message) {
+      mode = "progress";
+      narration.textContent = message || "Working.";
+      setFacts([]);
+      setNote("");
+      mail.hidden = true;
+      bar.hidden = false;
+      closeBtn.hidden = true;
+      nextBtn.hidden = true;
+    }
+    function showResult(payload, stepLabel, isLast) {
+      mode = "result";
+      kicker.textContent = stepLabel;
+      title.textContent = payload.title;
+      narration.textContent = payload.narration;
+      setFacts(payload.highlights);
+      setNote(payload.note);
+      setMail(payload.mail);
+      bar.hidden = true;
+      closeBtn.hidden = false;
+      nextBtn.hidden = false;
+      nextBtn.textContent = isLast ? "Done" : "Next";
+      nextBtn.focus();
+    }
+    function showError(message) {
+      mode = "error";
+      title.textContent = "This step stopped";
+      narration.textContent = message || "The step failed.";
+      setFacts([]);
+      setNote("");
+      mail.hidden = true;
+      bar.hidden = true;
+      closeBtn.hidden = false;
+      nextBtn.hidden = true;
+    }
+
+    document.querySelectorAll(".begin").forEach((button) => {
+      button.addEventListener("click", () => {
+        flow = FLOWS[button.dataset.flow];
+        stageIndex = 0;
+        showIntro(flow.stages[0], 0, flow.stages.length, flow.name);
+      });
+    });
+    document.getElementById("reset").addEventListener("click", () => {
+      flow = { name: "Reset", stages: [resetStage] };
+      stageIndex = 0;
+      showIntro(resetStage, 0, 1, "Reset");
+    });
+    closeBtn.addEventListener("click", () => { if (mode !== "progress") show(false); });
+
+    nextBtn.addEventListener("click", async () => {
+      if (mode === "intro") {
+        await runAction(flow.stages[stageIndex].action);
+        return;
+      }
+      if (mode !== "result") return;
+      if (walk && walkIndex < walk.length - 1) {
+        walkIndex += 1;
+        const step = walk[walkIndex];
+        showResult({ ...step, mail: walk.mail, note: walkIndex === walk.length - 1 ? "The live KAN issue from the failure step is not moved by this lab." : "" }, flow.name + " · lab", walkIndex === walk.length - 1 && stageIndex === flow.stages.length - 1);
+        return;
+      }
+      if (stageIndex < flow.stages.length - 1) {
+        stageIndex += 1;
+        showIntro(flow.stages[stageIndex], stageIndex, flow.stages.length, flow.name);
+        return;
+      }
+      show(false);
+    });
+
+    async function runAction(action) {
+      showProgress("Starting.");
+      const response = await fetch("/api/jobs", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action }) });
+      const started = await response.json();
+      if (!response.ok) {
+        showError(started.error || "Could not start.");
+        return;
+      }
+      poll(started.id);
+    }
+    function poll(id) {
+      if (pollTimer) clearTimeout(pollTimer);
+      const tick = async () => {
+        const response = await fetch("/api/jobs/" + id);
+        const job = await response.json();
+        if (job.state === "running") {
+          showProgress(job.current || "Working.");
+          pollTimer = setTimeout(tick, 1000);
+          return;
+        }
+        if (job.state === "error") {
+          showError(job.error);
+          return;
+        }
+        const payload = job.result;
+        if (payload.walk && payload.walk.length) {
+          walk = payload.walk;
+          walk.mail = payload.mail;
+          walkIndex = 0;
+          showResult({ ...walk[0], mail: payload.mail }, flow.name + " · lab", false);
+          return;
+        }
+        const last = stageIndex >= flow.stages.length - 1;
+        showResult(payload, flow.name + " · step " + (stageIndex + 1), last);
+      };
+      tick();
+    }
+
+    fetch("/api/ready").then((response) => response.json()).then((ready) => {
+      const banner = document.getElementById("banner");
+      const catalog = ready.sns_section ? "Confluence has the SNS demo section." : "Confluence SNS section: " + (ready.sns_message || "not ready");
+      banner.textContent = catalog + " " + (ready.mail_note || "");
+    }).catch(() => {
+      document.getElementById("banner").textContent = "The page could not read demo status.";
+    });
+  </script>
+</body>
+</html>

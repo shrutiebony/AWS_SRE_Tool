@@ -27,6 +27,10 @@ resource "aws_iam_role" "executor" {
 locals {
   executor_queue_arns = length(var.lab_queue_arns) == 0 ? ["arn:${data.aws_partition.current.partition}:sqs:${var.aws_region}:${data.aws_caller_identity.current.account_id}:lab-target-none"] : var.lab_queue_arns
   secret_arns         = compact([var.confluence_secret_arn, var.jira_secret_arn])
+  service_list_parts  = var.service_list_uri == "" ? [] : split("/", trimprefix(var.service_list_uri, "s3://"))
+  service_list_bucket = length(local.service_list_parts) == 0 ? "" : local.service_list_parts[0]
+  service_list_key = length(local.service_list_parts) < 2 ? "" : join("/", slice(local.service_list_parts, 1, length(local.service_list_parts)))
+  service_list_object_arn = local.service_list_bucket == "" ? "" : "arn:${data.aws_partition.current.partition}:s3:::${local.service_list_bucket}/${local.service_list_key}"
   discovery_statements = concat(
     [
       {
@@ -103,6 +107,20 @@ resource "aws_iam_role_policy" "discovery" {
   policy = jsonencode({
     Version   = "2012-10-17"
     Statement = local.discovery_statements
+  })
+}
+
+resource "aws_iam_role_policy" "service_list" {
+  count = local.service_list_object_arn == "" ? 0 : 1
+  name  = "service-list"
+  role  = aws_iam_role.discovery.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = ["s3:GetObject"]
+      Resource = local.service_list_object_arn
+    }]
   })
 }
 

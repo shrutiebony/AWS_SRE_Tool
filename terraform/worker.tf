@@ -47,6 +47,7 @@ resource "aws_lambda_function" "worker" {
       JIRA_SECRET_ARN        = var.jira_secret_arn
       JIRA_ISSUE_TYPE        = var.jira_issue_type
       JIRA_TRANSITION        = var.jira_transition
+      SRE_SERVICE_LIST_URI   = var.service_list_uri
       SRE_EXECUTOR_QUEUE_URL = aws_sqs_queue.repair.url
       SRE_ORDER_TABLE        = var.order_table_name
     }

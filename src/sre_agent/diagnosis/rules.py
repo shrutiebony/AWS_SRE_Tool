@@ -134,6 +134,16 @@ def diagnose(snapshot, now: datetime) -> Diagnosis:
         return _diagnose_lambda(snapshot, now)
     if record.resource_type == "ec2:instance":
         return _diagnose_ec2(snapshot)
+    catalog_reasons = [reason for reason in assessment.reasons if reason.startswith("Catalog rule")]
+    if catalog_reasons:
+        return _diagnosis(
+            snapshot,
+            problem=catalog_reasons[0],
+            code="catalog.symptom",
+            health=assessment.state,
+            status="unresolved",
+            evidence=_signal_evidence(assessment),
+        )
     return _diagnosis(
         snapshot,
         problem="Monitoring is not supported for this resource type.",

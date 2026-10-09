@@ -106,6 +106,49 @@ def collect_instances(reader, account_id: str, region: str, seen_at: str, page_s
     return base
 
 
+def collect_watched(reader, account_id: str, region: str, seen_at: str, resource_type: str) -> CollectorResult:
+    """List one resource type from the service list. The type name comes from data, not a new collector."""
+    base = _base(f"service-list:{resource_type}", account_id, region, seen_at)
+    try:
+        items = with_backoff(lambda: reader.list_tagged_resources(account_id, region, resource_type))
+    except SourceNotConfigured as exc:
+        base.status = "not-configured"
+        base.message = str(exc)
+        return base
+    except AccessDenied as exc:
+        base.status = "denied"
+        base.message = str(exc)
+        return base
+    except CloudError as exc:
+        base.status = "error"
+        base.message = str(exc)
+        return base
+    resources = []
+    for item in items:
+        resource_id = str(item.get("resource_id") or "")
+        if not resource_id:
+            continue
+        name = str(item.get("name") or resource_id.rsplit("/", 1)[-1].rsplit(":", 1)[-1])
+        resources.append(
+            ResourceRecord(
+                resource_id=resource_id,
+                account_id=account_id,
+                region=region,
+                resource_type=resource_type,
+                name=name,
+                last_seen_at=seen_at,
+                discovery_source="service-list",
+                sources=["service-list"],
+            )
+        )
+    base.resources = resources
+    base.status = "success"
+    base.authoritative_types = {resource_type}
+    base.confirm_absence_types = {resource_type}
+    base.message = f"Service list discovered {len(resources)} {resource_type} resources."
+    return base
+
+
 def collect_explorer(reader, account_id: str, region: str, seen_at: str) -> CollectorResult:
     base = _base("resource-explorer", account_id, region, seen_at)
     try:

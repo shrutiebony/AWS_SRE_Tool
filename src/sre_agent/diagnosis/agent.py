@@ -12,6 +12,7 @@ from sre_agent.clock import Clock, parse_time
 from sre_agent.discovery.service import Scope, _reader_for
 from sre_agent.evidence.validator import validate_evidence
 from sre_agent.models import Diagnosis, HealthAssessment, Relationship, ResourceRecord
+from sre_agent.monitoring.catalog import apply_catalog
 from sre_agent.monitoring.telemetry import sample
 from sre_agent.registry.store import Registry
 
@@ -95,6 +96,9 @@ class DiagnosticTools:
         else:
             start, end = time_window or self._window()
             assessment = sample(record, self._reader(record), start, end)
+            rules = getattr(self, "catalog_rules", [])
+            if rules:
+                assessment = apply_catalog(assessment, rules, record, self._reader(record), start, end)
         self._draft["assessments"][resource_id] = assessment
         return {
             "state": assessment.state,

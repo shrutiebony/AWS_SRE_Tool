@@ -44,6 +44,8 @@ class CycleReport:
     verifications: list[VerificationResult] = field(default_factory=list)
     escalations: list[Escalation] = field(default_factory=list)
     outcomes: list[Outcome] = field(default_factory=list)
+    agent_steps: list = field(default_factory=list)
+    narrations: list = field(default_factory=list)
 
 
 class OperationsAgent:
@@ -82,33 +84,30 @@ class OperationsAgent:
         self.verifier = RecoveryVerifier(clock, self.config.verify_window_seconds, self.config.verify_timeout_seconds)
 
     def run_cycle(self) -> CycleReport:
-        self.inventory()
-        assessments = self.monitor()
-        diagnoses = self.diagnose_open()
-        decisions = self.review(diagnoses)
-        actions = self.execute([item for item in decisions if item.outcome == "execute"])
-        verifications = self.verify(actions)
-        self._note_agent_health()
-        stored = {item.incident_id: item for item in self.registry.incidents()}
-        diagnoses = [stored.get(item.incident_id, item) for item in diagnoses]
-        return CycleReport(
-            scans=self.registry.scans(),
-            resources=self.registry.list_resources(),
-            assessments=assessments,
-            diagnoses=diagnoses,
-            decisions=decisions,
-            actions=actions,
-            verifications=verifications,
-            escalations=self.registry.escalations(),
-            outcomes=self.registry.outcomes(),
-        )
+        import os
+
+        from sre_agent.agents.workflow import run_guarded_cycle
+
+        complete = None
+        if os.environ.get("SRE_ENABLE_GEMINI") == "true" and os.environ.get("GEMINI_API_KEY", "").strip():
+            from sre_agent.agents.narrator import _gemini_complete
+
+            complete = _gemini_complete
+        return run_guarded_cycle(self, complete)
 
     def inventory(self):
+        self._catalog_loaded = False
+        listed = self._service_list()
+        self._load_catalog()
+        from sre_agent.discovery.service_list import types_to_discover
+
+        self.discovery.watched = types_to_discover(self.catalog_rules, listed)
         return self.discovery.run()
 
     def monitor(self) -> list[HealthAssessment]:
+        if not getattr(self, "_catalog_loaded", False):
+            self._load_catalog()
         self.attach_packs()
-        self._load_catalog()
         start, end = self._lookback()
         assessments = []
         for record in self.registry.list_resources():
@@ -117,6 +116,7 @@ class OperationsAgent:
         return assessments
 
     def diagnose_open(self) -> list[Diagnosis]:
+        self.tools.catalog_rules = list(self.catalog_rules)
         diagnoses = []
         for resource_id in self._targets():
             diagnosis = self.agent.investigate(resource_id)
@@ -228,11 +228,12 @@ class OperationsAgent:
         return self.clock.now() - latest >= timedelta(seconds=self.config.reconcile_interval_seconds)
 
     def attach_packs(self) -> None:
+        catalog_types = {rule.resource_type for rule in self.catalog_rules}
         for record in self.registry.list_resources():
             if record.presence != "present":
                 record.monitoring_status = "not-configured"
                 record.allowed_runbooks = []
-            elif runbooks_for(record) or record.resource_type in SUPPORTED:
+            elif runbooks_for(record) or record.resource_type in SUPPORTED or record.resource_type in catalog_types:
                 record.monitoring_status = "configured"
                 record.allowed_runbooks = runbooks_for(record)
             else:
@@ -453,13 +454,36 @@ class OperationsAgent:
             )
         )
 
+    def _service_list(self):
+        if hasattr(self, "_listed_services"):
+            return self._listed_services
+        from sre_agent.discovery.service_list import ServiceListError, load_service_list
+
+        try:
+            listed = load_service_list()
+        except ServiceListError as exc:
+            listed = []
+            self.registry.add_scan(
+                ScanAccess(
+                    account_id="*",
+                    region="*",
+                    collector="service-list",
+                    status="error",
+                    scanned_at=self.clock.iso(),
+                    message=str(exc),
+                )
+            )
+        self._listed_services = listed
+        return listed
+
     def _load_catalog(self) -> None:
+        self._catalog_loaded = True
         if self.confluence is None:
             self.catalog_status = "not-configured"
             self.catalog_rules = []
             return
         try:
-            catalog = load_catalog(self.confluence)
+            catalog = load_catalog(self.confluence, services=self._service_list())
         except (ConfluenceError, ValueError) as exc:
             self.catalog_status = "failed"
             self.catalog_rules = []

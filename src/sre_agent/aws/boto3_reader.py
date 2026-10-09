@@ -159,11 +159,19 @@ class Boto3Reader:
         end: datetime,
         stat: str | None = None,
         period: int | None = None,
+        namespace: str | None = None,
+        dimensions: list | None = None,
     ):
         del account_id
-        try:
-            namespace, dimensions = metric_identity(resource_id)
-        except ValueError:
+        if namespace is None or dimensions is None:
+            try:
+                mapped_namespace, mapped_dimensions = metric_identity(resource_id)
+            except ValueError:
+                mapped_namespace, mapped_dimensions = None, None
+            namespace = namespace or mapped_namespace
+            if dimensions is None:
+                dimensions = mapped_dimensions
+        if not namespace or not dimensions:
             return {name: [] for name in metric_names}
         queries = []
         for index, name in enumerate(metric_names):
@@ -258,6 +266,27 @@ class Boto3Reader:
     def caller_account(self) -> str:
         response = self._invoke(lambda: self.client("sts", self.region or "us-east-1").get_caller_identity())
         return response["Account"]
+
+    def list_tagged_resources(self, account_id: str, region: str, resource_type: str) -> list[dict]:
+        del account_id
+        client = self.client("resourcegroupstaggingapi", region)
+        items = []
+        token = None
+        while True:
+            kwargs = {"ResourceTypeFilters": [resource_type], "ResourcesPerPage": 100}
+            if token:
+                kwargs["PaginationToken"] = token
+            response = self._invoke(lambda kwargs=kwargs: client.get_resources(**kwargs))
+            for mapping in response.get("ResourceTagMappingList", []):
+                arn = str(mapping.get("ResourceARN") or "")
+                if not arn:
+                    continue
+                name = arn.rsplit("/", 1)[-1].rsplit(":", 1)[-1]
+                items.append({"resource_id": arn, "name": name, "resource_type": resource_type})
+            token = response.get("PaginationToken") or ""
+            if not token:
+                break
+        return items
 
     def search_resources(self, account_id: str, region: str) -> list[dict]:
         from sre_agent.aws.pages import drain_pages
@@ -501,11 +530,11 @@ class Boto3Reader:
             "config": {"api_id": name, "integrations": integrations},
         }
 
-    def run_logs_query(self, account_id, region, resource_id, query, start: datetime, end: datetime) -> list[dict]:
+    def run_logs_query(self, account_id, region, resource_id, query, start: datetime, end: datetime, log_group: str | None = None) -> list[dict]:
         from sre_agent.aws.errors import CloudError
 
         del account_id
-        group = log_group_for(resource_id)
+        group = log_group or log_group_for(resource_id)
         if group is None:
             return []
         started = self._invoke(

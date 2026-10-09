@@ -18,9 +18,10 @@ def format_report(report: CycleReport) -> str:
     for record in sorted(report.resources, key=lambda item: (item.resource_type, item.name)):
         view = record.public_view()
         owner = record.ownership.get("owner") or record.metadata.get("owner") or "-"
+        source = record.discovery_source or "-"
         lines.append(
             f"  {view['resource_type']:<16} {record.name:<18} {record.presence:<10} "
-            f"{view['monitoring_status']:<16} {record.health:<10} owner={owner}"
+            f"{view['monitoring_status']:<16} {record.health:<10} owner={owner} source={source}"
         )
     lines.append("")
     lines.append("Diagnosis")
@@ -28,7 +29,15 @@ def format_report(report: CycleReport) -> str:
         lines.append("  none")
     for diagnosis in report.diagnoses:
         action = diagnosis.proposed_action.runbook_id if diagnosis.proposed_action else "none"
-        lines.append(f"  {diagnosis.status:<14} {diagnosis.problem_code:<28} action={action}")
+        resource_name = next(
+            (item.name for item in report.resources if item.resource_id == diagnosis.resource_id),
+            diagnosis.resource_id,
+        )
+        jira_key = diagnosis.jira_issue_key or "-"
+        lines.append(
+            f"  {diagnosis.status:<14} {diagnosis.problem_code:<28} action={action} "
+            f"resource={resource_name} jira={jira_key}"
+        )
         lines.append(f"    {diagnosis.observed_problem}")
     lines.append("")
     lines.append("Policy gate")
@@ -47,6 +56,13 @@ def format_report(report: CycleReport) -> str:
             f"  {action.runbook_id} api={action.status} verification={verification.status} rollback={verification.rollback}"
         )
         lines.append(f"    {verification.reasons[0] if verification.reasons else ''}")
+    if report.agent_steps:
+        lines.append("")
+        lines.append("Agents")
+        for step in report.agent_steps:
+            lines.append(f"  {step.agent:<14} {step.tool:<12} {step.status}")
+        for note in report.narrations:
+            lines.append(f"  narrator       explain      {note.source}  {note.text}")
     return "\n".join(lines)
 
 

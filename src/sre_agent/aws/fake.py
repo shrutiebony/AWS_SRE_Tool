@@ -73,6 +73,7 @@ class FakeCloud:
         self.tables: dict[str, dict] = {}
         self.rest_apis: dict[str, dict] = {}
         self.explorer_page_error = False
+        self.tagged: dict[str, list[dict]] = {}
 
     def add_function(self, record: FunctionRecord) -> None:
         self.functions[record.name] = record
@@ -157,8 +158,10 @@ class FakeCloud:
         end: datetime,
         stat: str | None = None,
         period: int | None = None,
+        namespace: str | None = None,
+        dimensions: list | None = None,
     ) -> dict[str, list[tuple[datetime, float]]]:
-        del period
+        del period, namespace, dimensions
         self._guard("get_metrics", account_id, region)
         stored = self.metrics.get(resource_id, {})
         result = {}
@@ -313,8 +316,21 @@ class FakeCloud:
         for order_id in order_ids:
             self.orders[order_id] = {"status": "processed", "processed_at": at}
 
-    def run_logs_query(self, account_id: str, region: str, resource_id: str, query: str, start: datetime, end: datetime) -> list[dict]:
-        del start, end
+    def list_tagged_resources(self, account_id: str, region: str, resource_type: str) -> list[dict]:
+        self._guard("list_tagged", account_id, region)
+        return [dict(item) for item in self.tagged.get(resource_type, [])]
+
+    def run_logs_query(
+        self,
+        account_id: str,
+        region: str,
+        resource_id: str,
+        query: str,
+        start: datetime,
+        end: datetime,
+        log_group: str | None = None,
+    ) -> list[dict]:
+        del start, end, log_group
         self._guard("logs_insights", account_id, region)
         rows = []
         for item in self.logs.get(resource_id, []):

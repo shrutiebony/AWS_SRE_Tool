@@ -48,6 +48,8 @@ class CatalogRule:
     period_seconds: int = 300
     role: str = "primary"
     threshold_expression: str = ""
+    namespace: str = ""
+    dimension: str = ""
 
     def resolved(self, values: dict[str, str]) -> "CatalogRule":
         return CatalogRule(
@@ -63,6 +65,8 @@ class CatalogRule:
             period_seconds=self.period_seconds,
             role=self.role,
             threshold_expression=_fill(self.threshold_expression, values),
+            namespace=_fill(self.namespace, values),
+            dimension=_fill(self.dimension, values),
         )
 
 
@@ -116,46 +120,73 @@ class HttpConfluence:
         return version, storage
 
 
-def load_catalog(client, page_id: str = "") -> Catalog:
+def load_catalog(client, page_id: str = "", services: list | None = None) -> Catalog:
     version, storage = client.fetch_page()
-    rules = parse_rule_table(storage, version)
+    rules = parse_rule_table(storage, version, services)
     errors = validate_rules(rules)
     if errors:
         raise ConfluenceError("; ".join(errors))
     return Catalog(version=version, page_id=page_id or getattr(client, "page_id", ""), rules=rules)
 
 
-def parse_rule_table(storage: str, version: int) -> list[CatalogRule]:
-    rules = _rules_in_order(storage, version)
+def parse_rule_table(storage: str, version: int, services: list | None = None) -> list[CatalogRule]:
+    rules = _rules_in_order(storage, version, services)
     if rules:
         return rules
     rows = _table_rows(storage)
     if not rows:
         raise ConfluenceError("The Confluence page has no rule table")
-    return _rules_from_rows(rows, version, "")
+    return _rules_from_rows(rows, version, "", _type_map(services))
 
 
-def _rules_in_order(storage: str, version: int) -> list[CatalogRule]:
+def _rules_in_order(storage: str, version: int, services: list | None = None) -> list[CatalogRule]:
     rules: list[CatalogRule] = []
     service = ""
+    explicit_type = ""
+    type_map = _type_map(services)
     for heading, table in re.findall(r"<h2\b[^>]*>(.*?)</h2>|<table\b[^>]*>(.*?)</table>", storage, flags=re.IGNORECASE | re.DOTALL):
         if heading:
             text = _clean(heading)
             if text.lower().startswith("service:"):
-                service = text.split(":", 1)[1].strip()
+                service, explicit_type = _service_heading(text.split(":", 1)[1].strip())
             continue
-        rules.extend(_rules_from_rows(_rows(table), version, service))
+        rules.extend(_rules_from_rows(_rows(table), version, service, type_map, explicit_type))
     return rules
 
 
-def _rules_from_rows(rows: list[list[str]], version: int, service: str) -> list[CatalogRule]:
+def _type_map(services: list | None) -> dict[str, str]:
+    mapped = {}
+    for item in services or []:
+        service = getattr(item, "service", "")
+        resource_type = getattr(item, "resource_type", "")
+        if service and resource_type:
+            mapped[str(service).strip().lower()] = resource_type
+    return mapped
+
+
+def _service_heading(text: str) -> tuple[str, str]:
+    match = re.fullmatch(r"(.+?)\s*\(([a-z0-9]+:[a-z0-9_-]+)\)", text.strip(), flags=re.IGNORECASE)
+    if match:
+        return match.group(1).strip(), match.group(2)
+    if re.fullmatch(r"[a-z0-9]+:[a-z0-9_-]+", text.strip(), flags=re.IGNORECASE):
+        return text.strip(), text.strip()
+    return text.strip(), ""
+
+
+def _rules_from_rows(
+    rows: list[list[str]],
+    version: int,
+    service: str,
+    type_map: dict[str, str] | None = None,
+    explicit_type: str = "",
+) -> list[CatalogRule]:
     if not rows:
         return []
     header = [_clean(cell) for cell in rows[0]]
     if all(name in header for name in REQUIRED_COLUMNS):
         return _legacy_rules(rows, header, version)
     if all(name in header for name in SYMPTOM_COLUMNS):
-        return _symptom_rules(rows, header, version, service)
+        return _symptom_rules(rows, header, version, service, type_map or {}, explicit_type)
     return []
 
 
@@ -183,7 +214,14 @@ def _legacy_rules(rows: list[list[str]], header: list[str], version: int) -> lis
     return rules
 
 
-def _symptom_rules(rows: list[list[str]], header: list[str], version: int, service: str) -> list[CatalogRule]:
+def _symptom_rules(
+    rows: list[list[str]],
+    header: list[str],
+    version: int,
+    service: str,
+    type_map: dict[str, str],
+    explicit_type: str,
+) -> list[CatalogRule]:
     index = {name: header.index(name) for name in header}
     rules = []
     for row in rows[1:]:
@@ -194,7 +232,14 @@ def _symptom_rules(rows: list[list[str]], header: list[str], version: int, servi
             continue
         kind = values.get("Type", "metric")
         namespace = values.get("Namespace / log group", "")
-        resource_type = _NAMESPACE_TYPES.get(namespace) or _SERVICE_TYPES.get(service, "")
+        row_type = values.get("Resource type", "")
+        resource_type = (
+            _NAMESPACE_TYPES.get(namespace)
+            or _SERVICE_TYPES.get(service, "")
+            or row_type
+            or explicit_type
+            or type_map.get(service.strip().lower(), "")
+        )
         metric = values["Metric / query"]
         statistic = _STATS.get(values.get("Stat", ""), "Count")
         expression = ""
@@ -226,6 +271,8 @@ def _symptom_rules(rows: list[list[str]], header: list[str], version: int, servi
                 period_seconds=window * 60,
                 role="supporting" if values.get("Role", "").lower() == "supporting" else "primary",
                 threshold_expression=threshold_expression,
+                namespace=namespace,
+                dimension=values.get("Dimension", ""),
             )
         )
     return rules

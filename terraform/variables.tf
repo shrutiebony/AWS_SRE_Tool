@@ -145,8 +145,8 @@ variable "jira_issue_type" {
   default     = ""
 }
 
-variable "jira_transition" {
+variable "service_list_uri" {
   type        = string
-  description = "Workflow transition used only after verified recovery."
-  default     = "Done"
+  description = "Optional s3://bucket/key JSON list of extra resource types to inventory. Empty monitors the built-in types plus every typed service on the Confluence page."
+  default     = ""
 }

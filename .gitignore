@@ -6,6 +6,7 @@ __pycache__/
 *.tfstate
 *.tfstate.*
 *.tfvars
+.env
 crash.log
 .sre-agent/
 terraform/*-result.json
