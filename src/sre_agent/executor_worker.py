@@ -6,12 +6,13 @@ Repairs stay off until SRE_REPAIRS_ENABLED=true. Deployed Terraform leaves that 
 from __future__ import annotations
 
 import json
-import os
 
 
 def handler(event, context) -> dict:
     del context
-    if os.environ.get("SRE_REPAIRS_ENABLED") != "true":
+    from sre_agent.local_config import get
+
+    if get("SRE_REPAIRS_ENABLED") != "true":
         return {"handled": [], "repairs": "disabled"}
     agent = build_executor()
     handled = []
@@ -45,23 +46,28 @@ def build_executor():
     from sre_agent.service import OperationsAgent
     from sre_agent.worker import _confluence, _jira
 
-    region = os.environ.get("SRE_REGION", "us-east-2")
-    account_id = os.environ["SRE_ACCOUNT_ID"]
-    reader = Boto3Reader(region=region, order_table=os.environ.get("SRE_ORDER_TABLE") or None)
+    from sre_agent.local_config import get
+
+    region = get("SRE_REGION")
+    account_id = get("SRE_ACCOUNT_ID")
+    table_name = get("SRE_REGISTRY_TABLE")
+    if not region or not account_id or not table_name:
+        raise RuntimeError("Account, region, and registry table come from config.local.json or the process environment.")
+    reader = Boto3Reader(region=region, order_table=get("SRE_ORDER_TABLE") or None)
     scope = Scope(accounts=[AccountTarget(account_id=account_id, regions=[region], reader=reader)])
     import boto3
 
-    registry = Registry(Boto3TableAdapter(boto3.resource("dynamodb").Table(os.environ["SRE_REGISTRY_TABLE"])))
+    registry = Registry(Boto3TableAdapter(boto3.resource("dynamodb").Table(table_name)))
     from sre_agent.integrations.secrets import secret_value
 
-    approval_mode = os.environ.get("SRE_APPROVAL_MODE", "required")
-    targets = frozenset(item for item in os.environ.get("LAB_TARGETS", "").split(",") if item)
+    approval_mode = get("SRE_APPROVAL_MODE") or "required"
+    targets = frozenset(item for item in get("LAB_TARGETS").split(",") if item)
     config = AgentConfig(
         mode="automatic",
         enabled_automatic_runbooks=frozenset(["sqs.redrive_dlq"]),
         lab_targets=targets,
-        require_approval=os.environ.get("SRE_REQUIRE_APPROVAL", "true") == "true" or approval_mode == "required",
-        approvers=frozenset(item for item in os.environ.get("SRE_APPROVERS", "").split(",") if item),
+        require_approval=(get("SRE_REQUIRE_APPROVAL") or "true") == "true" or approval_mode == "required",
+        approvers=frozenset(item for item in get("SRE_APPROVERS").split(",") if item),
         approval_mode=approval_mode,
         jira_issue_type=secret_value("JIRA_ISSUE_TYPE", "JIRA_SECRET_ARN") or "Task",
         jira_transition=secret_value("JIRA_TRANSITION", "JIRA_SECRET_ARN") or "Done",

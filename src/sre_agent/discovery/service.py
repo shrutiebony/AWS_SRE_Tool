@@ -23,6 +23,7 @@ from sre_agent.discovery.collectors import (
     record_from_detail,
     relationships_for_detail,
 )
+from sre_agent.aws.parallel import parallel_map
 from sre_agent.models import ScanAccess
 from sre_agent.registry.store import Registry
 
@@ -53,7 +54,9 @@ class DiscoveryReconciliationService:
         self.watched: list = []
 
     def run(self) -> list[CollectorResult]:
-        results = self.scan()
+        return self.finish(self.scan())
+
+    def finish(self, results: list[CollectorResult]) -> list[CollectorResult]:
         self.apply(results)
         status = "partial" if any(item.status == "error" for item in results) else "success"
         self.registry.add_scan(
@@ -103,36 +106,7 @@ class DiscoveryReconciliationService:
                 continue
             results.append(self._terraform(account))
             for region in account.regions:
-                results.append(self._explorer(account, region))
-                results.append(self._config(account, region))
-                seen_at = self.clock.iso()
-                results.append(
-                    self._note(collect_lambdas(account.reader, account.account_id, region, seen_at, self.scope.page_size))
-                )
-                results.append(
-                    self._note(collect_queues(account.reader, account.account_id, region, seen_at, self.scope.page_size))
-                )
-                results.append(
-                    self._note(collect_instances(account.reader, account.account_id, region, seen_at, self.scope.page_size))
-                )
-                results.append(
-                    self._note(collect_tables(account.reader, account.account_id, region, seen_at, self.scope.page_size))
-                )
-                results.append(
-                    self._note(collect_rest_apis(account.reader, account.account_id, region, seen_at, self.scope.page_size))
-                )
-                for watched in self.watched:
-                    results.append(
-                        self._note(
-                            collect_watched(
-                                account.reader,
-                                account.account_id,
-                                region,
-                                seen_at,
-                                watched.resource_type,
-                            )
-                        )
-                    )
+                results.extend(self._region_collectors(account, region))
             results.append(
                 self._note(
                     CollectorResult(
@@ -146,6 +120,54 @@ class DiscoveryReconciliationService:
                 )
             )
         return results
+
+    def scan_watched(self, blocked: set[str] | None = None) -> list[CollectorResult]:
+        """Extra service-list types. Accounts already denied are left alone."""
+        skipped = blocked or set()
+        results: list[CollectorResult] = []
+        if not self.watched:
+            return results
+        for account in self.scope.accounts:
+            if account.reader is None or account.account_id in skipped:
+                continue
+            for region in account.regions:
+                seen_at = self.clock.iso()
+                jobs = [
+                    (
+                        lambda watched=watched, seen_at=seen_at, account=account, region=region: self._note(
+                            collect_watched(
+                                account.reader,
+                                account.account_id,
+                                region,
+                                seen_at,
+                                watched.resource_type,
+                            )
+                        )
+                    )
+                    for watched in self.watched
+                ]
+                results.extend(parallel_map(lambda fn: fn(), jobs))
+        return results
+
+    def _region_collectors(self, account: AccountTarget, region: str) -> list[CollectorResult]:
+        seen_at = self.clock.iso()
+        page_size = self.scope.page_size
+        jobs = [
+            lambda: self._explorer(account, region),
+            lambda: self._config(account, region),
+            lambda: self._note(collect_lambdas(account.reader, account.account_id, region, seen_at, page_size)),
+            lambda: self._note(collect_queues(account.reader, account.account_id, region, seen_at, page_size)),
+            lambda: self._note(collect_instances(account.reader, account.account_id, region, seen_at, page_size)),
+            lambda: self._note(collect_tables(account.reader, account.account_id, region, seen_at, page_size)),
+            lambda: self._note(collect_rest_apis(account.reader, account.account_id, region, seen_at, page_size)),
+        ]
+        for watched in self.watched:
+            jobs.append(
+                lambda watched=watched: self._note(
+                    collect_watched(account.reader, account.account_id, region, seen_at, watched.resource_type)
+                )
+            )
+        return parallel_map(lambda fn: fn(), jobs)
 
     def apply(self, results: list[CollectorResult]) -> None:
         for result in results:

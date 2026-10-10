@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import os
-from pathlib import Path
 
 from sre_agent.lab.fault_injection import main as lab_main
 from sre_agent.lab.scenarios import build_world
@@ -15,24 +13,20 @@ from sre_agent.service import OperationsAgent
 
 
 def _load_local_env() -> None:
-    """Fill unset variables from a gitignored .env next to the project."""
-    path = Path(__file__).resolve().parents[2] / ".env"
-    if not path.is_file():
-        return
-    for line in path.read_text(encoding="utf-8").splitlines():
-        text = line.strip()
-        if not text or text.startswith("#") or "=" not in text:
-            continue
-        key, value = text.split("=", 1)
-        os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+    """Fill unset variables from config.local.json. Already-set variables win."""
+    from sre_agent.local_config import load_local_config
+
+    load_local_config()
 
 
 def main(argv: list[str] | None = None) -> int:
     _load_local_env()
     parser = argparse.ArgumentParser(description="Discover existing resources, monitor them, and gate one repair.")
     parser.add_argument("command", choices=("demo", "lab", "inventory", "mcp"))
-    parser.add_argument("--account", default=os.environ.get("SRE_ACCOUNT_ID", "123456789012"))
-    parser.add_argument("--region", default=os.environ.get("SRE_REGION", "us-east-2"))
+    from sre_agent.local_config import get
+
+    parser.add_argument("--account", default=get("SRE_ACCOUNT_ID"))
+    parser.add_argument("--region", default=get("SRE_REGION"))
     args = parser.parse_args(argv)
     if args.command == "demo":
         return demo()
@@ -43,6 +37,9 @@ def main(argv: list[str] | None = None) -> int:
 
         serve()
         return 0
+    if not args.account or not args.region:
+        print("Account and region come from config.local.json or from --account and --region.")
+        return 2
     return inventory(args.account, args.region)
 
 
@@ -72,10 +69,12 @@ def build_live_agent(account_id: str, region: str) -> OperationsAgent:
     from sre_agent.registry.store import Boto3TableAdapter, Registry
     from sre_agent.worker import _confluence, _jira
 
+    from sre_agent.local_config import get
+
     reader = Boto3Reader(
         region=region,
-        explorer_view_arn=os.environ.get("SRE_EXPLORER_VIEW_ARN"),
-        order_table=os.environ.get("SRE_ORDER_TABLE") or None,
+        explorer_view_arn=get("SRE_EXPLORER_VIEW_ARN") or None,
+        order_table=get("SRE_ORDER_TABLE") or None,
     )
     scope = Scope(
         accounts=[
@@ -83,12 +82,12 @@ def build_live_agent(account_id: str, region: str) -> OperationsAgent:
                 account_id=account_id,
                 regions=[region],
                 reader=reader,
-                enable_resource_explorer=bool(os.environ.get("SRE_EXPLORER_VIEW_ARN")),
-                enable_config=os.environ.get("SRE_ENABLE_CONFIG") == "true",
+                enable_resource_explorer=bool(get("SRE_EXPLORER_VIEW_ARN")),
+                enable_config=get("SRE_ENABLE_CONFIG") == "true",
             )
         ]
     )
-    table_name = os.environ.get("SRE_REGISTRY_TABLE", "")
+    table_name = get("SRE_REGISTRY_TABLE")
     if table_name:
         import boto3
 
@@ -105,13 +104,27 @@ def build_live_agent(account_id: str, region: str) -> OperationsAgent:
     )
 
 
-def run_live_cycle(account_id: str, region: str):
-    """Run one inventory cycle and return the report plus the agent that produced it."""
+def run_live_cycle(account_id: str, region: str, *, display: bool = False):
+    """Run one inventory cycle and return the report plus the agent that produced it.
+
+    A display cycle discovers and reads health. It does not call the narrator,
+    write Jira, repair, or verify.
+    """
     agent = build_live_agent(account_id, region)
+    if display:
+        return agent.run_display_cycle(), agent
     return agent.run_cycle(), agent
 
 
 def inventory(account_id: str, region: str) -> int:
+    from sre_agent.demo_ui import bind_settings, refresh_aws_login
+
+    bind_settings()
+    try:
+        refresh_aws_login()
+    except RuntimeError as exc:
+        print(exc)
+        return 2
     report, _agent = run_live_cycle(account_id, region)
     print(format_report(report))
     return 0

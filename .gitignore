@@ -7,6 +7,10 @@ __pycache__/
 *.tfstate.*
 *.tfvars
 .env
+config.local.json
+demo_ui/recipients.local.json
+demo_ui/demo_state.json
+demo_ui/_mail_request.json
 crash.log
 .sre-agent/
 terraform/*-result.json

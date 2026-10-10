@@ -289,18 +289,23 @@ def _collect_listed(collector, source, resource_type, account_id, region, seen_a
         base.message = str(exc)
         return base
 
-    errors: list[str] = []
-    for summary in summaries:
+    def load_one(summary: dict) -> tuple[dict | None, str | None]:
         label = summary.get("name") or summary.get("url") or "resource"
         try:
             detail = with_backoff(lambda summary=summary: load_detail(summary))
         except NotFound:
-            continue
+            return None, None
         except AccessDenied as exc:
-            errors.append(f"AccessDenied {label}: {exc}")
-            continue
+            return None, f"AccessDenied {label}: {exc}"
         except CloudError as exc:
-            errors.append(f"{label}: {exc}")
+            return None, f"{label}: {exc}"
+        return detail, None
+
+    # One client per service. Concurrent calls on that client were slower than a short sequence.
+    loaded = [load_one(summary) for summary in summaries]
+    errors = [note for _detail, note in loaded if note]
+    for detail, note in loaded:
+        if detail is None or note:
             continue
         base.resources.append(record_from_detail(detail, source, seen_at))
         _, relationships = relationships_for_detail(detail)

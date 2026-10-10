@@ -196,8 +196,9 @@ def test_failed_catalog_load_is_not_healthy():
     confluence.failures = 1
     agent = OperationsAgent(world.scope, Registry(), world.clock, confluence=confluence)
     report = agent.run_cycle()
-    assert all(item.state == "unknown" for item in report.assessments)
     assert any(item.collector == "confluence" and item.status == "error" for item in report.scans)
+    assert all(item.state != "unknown" for item in report.assessments)
+    assert any(item.state == "healthy" for item in report.assessments)
 
 
 def test_keyword_logs_without_message_ids_do_not_redrive():

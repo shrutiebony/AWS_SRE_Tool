@@ -32,6 +32,9 @@ from sre_agent.policy.gate import PolicyGate
 from sre_agent.registry.store import Registry
 from sre_agent.verification.verifier import RecoveryVerifier
 
+# A page view reads recent log lines. Recommend and repair keep the catalog period.
+DISPLAY_LOG_SECONDS = 120
+
 
 @dataclass
 class CycleReport:
@@ -84,23 +87,42 @@ class OperationsAgent:
         self.verifier = RecoveryVerifier(clock, self.config.verify_window_seconds, self.config.verify_timeout_seconds)
 
     def run_cycle(self) -> CycleReport:
-        import os
-
         from sre_agent.agents.workflow import run_guarded_cycle
 
         complete = None
-        if os.environ.get("SRE_ENABLE_GEMINI") == "true" and os.environ.get("GEMINI_API_KEY", "").strip():
+        from sre_agent.local_config import get
+
+        if get("SRE_ENABLE_GEMINI") == "true" and get("GEMINI_API_KEY"):
             from sre_agent.agents.narrator import _gemini_complete
 
             complete = _gemini_complete
         return run_guarded_cycle(self, complete)
 
+    def run_display_cycle(self) -> CycleReport:
+        """Live discovery and health for a page. No narrator, Jira write, repair, or verification."""
+        self.inventory()
+        previous = self.config.metric_lookback_seconds
+        self.config.metric_lookback_seconds = self._display_seconds()
+        self._log_window_seconds = DISPLAY_LOG_SECONDS
+        try:
+            assessments = self.monitor()
+            diagnoses = self._display_diagnoses(assessments)
+        finally:
+            self.config.metric_lookback_seconds = previous
+            self._log_window_seconds = None
+        return CycleReport(
+            scans=self.registry.scans(),
+            resources=self.registry.list_resources(),
+            assessments=assessments,
+            diagnoses=diagnoses,
+        )
+
     def inventory(self):
         self._catalog_loaded = False
         listed = self._service_list()
-        self._load_catalog()
         from sre_agent.discovery.service_list import types_to_discover
 
+        self._load_catalog()
         self.discovery.watched = types_to_discover(self.catalog_rules, listed)
         return self.discovery.run()
 
@@ -109,10 +131,22 @@ class OperationsAgent:
             self._load_catalog()
         self.attach_packs()
         start, end = self._lookback()
+        records = [
+            record
+            for record in self.registry.list_resources()
+            if record.presence == "present" and record.monitoring_status == "configured"
+        ]
+        prepared: dict[int, object] = {}
+        for record in records:
+            reader = _reader_for(self.scope, record.account_id)
+            key = id(reader)
+            if key not in prepared:
+                group = [item for item in records if id(_reader_for(self.scope, item.account_id)) == key]
+                prepared[key] = self._prepare_reader(reader, group, start, end)
         assessments = []
-        for record in self.registry.list_resources():
-            if record.presence == "present" and record.monitoring_status == "configured":
-                assessments.append(self._apply_sample(record, start, end, False))
+        for record in records:
+            reader = prepared[id(_reader_for(self.scope, record.account_id))]
+            assessments.append(self._apply_sample(record, start, end, False, reader=reader))
         return assessments
 
     def diagnose_open(self) -> list[Diagnosis]:
@@ -239,6 +273,8 @@ class OperationsAgent:
             else:
                 record.monitoring_status = "unsupported"
                 record.allowed_runbooks = []
+                record.health = "degraded"
+                record.health_reasons = ["No monitoring pack is registered for this resource type."]
             self.registry.save(record)
 
     def _targets(self) -> list[str]:
@@ -421,25 +457,60 @@ class OperationsAgent:
         record = self.registry.get_by_resource_id(diagnosis.resource_id)
         if record is None:
             return
-        key = f"{record.account_id}|{record.region}|{record.resource_id}|{diagnosis.problem_code}"
-        diagnosis.dedup_key = key
+        from sre_agent.integrations.jira import issue_dedup_key
+
+        diagnosis.dedup_key = issue_dedup_key(diagnosis)
         open_states = {"open", "recommended", "executing", "escalated", "unresolved"}
         for existing in self.registry.incidents():
-            if existing.dedup_key == key and existing.status in open_states and existing.incident_id != diagnosis.incident_id:
+            same_resource = existing.resource_id == diagnosis.resource_id and existing.problem_code == diagnosis.problem_code
+            if same_resource and existing.status in open_states and existing.incident_id != diagnosis.incident_id:
                 diagnosis.incident_id = existing.incident_id
                 if decision is not None:
                     decision.incident_id = existing.incident_id
                 if existing.jira_issue_key:
                     diagnosis.jira_issue_key = existing.jira_issue_key
+                break
+        for existing in self.registry.incidents():
+            if existing.dedup_key == diagnosis.dedup_key and existing.status in open_states and existing.jira_issue_key:
+                diagnosis.jira_issue_key = existing.jira_issue_key
                 return
+
+    def _where_seen(self, diagnosis: Diagnosis) -> list[str]:
+        """Checker identity plus the resource name, only for resources that have this problem."""
+        open_states = {"open", "recommended", "executing", "escalated", "unresolved"}
+        lines: dict[str, str] = {}
+
+        def add(record: ResourceRecord | None, resource_id: str) -> None:
+            if record is None:
+                if resource_id:
+                    lines[resource_id] = resource_id
+                return
+            if record.health == "healthy":
+                return
+            lines[record.resource_id] = _where_line(record)
+
+        record = self.registry.get_by_resource_id(diagnosis.resource_id)
+        if diagnosis.status != "recovered" and diagnosis.problem_code != "healthy" and diagnosis.health != "healthy":
+            add(record, diagnosis.resource_id)
+        for existing in self.registry.incidents():
+            if existing.dedup_key != diagnosis.dedup_key or existing.status not in open_states:
+                continue
+            if existing.problem_code == "healthy" or existing.health == "healthy":
+                continue
+            add(self.registry.get_by_resource_id(existing.resource_id), existing.resource_id)
+        return [lines[key] for key in sorted(lines, key=lambda item: lines[item])]
 
     def _sync_jira(self, diagnosis: Diagnosis) -> None:
         if self.jira is None or not diagnosis.dedup_key:
             return
+        diagnosis.where_seen = self._where_seen(diagnosis)
+        diagnosis.where_authoritative = True
         last = "Jira synchronization failed."
         for _ in range(3):
             try:
                 diagnosis.jira_issue_key = self.jira.sync(diagnosis)
+                if getattr(self.jira, "last_created", False):
+                    _mail_new_ticket(diagnosis)
                 return
             except Exception as exc:
                 last = str(exc)
@@ -476,8 +547,9 @@ class OperationsAgent:
         self._listed_services = listed
         return listed
 
-    def _load_catalog(self) -> None:
+    def _load_catalog(self, *, record: bool = True) -> None:
         self._catalog_loaded = True
+        self._catalog_message = ""
         if self.confluence is None:
             self.catalog_status = "not-configured"
             self.catalog_rules = []
@@ -487,30 +559,92 @@ class OperationsAgent:
         except (ConfluenceError, ValueError) as exc:
             self.catalog_status = "failed"
             self.catalog_rules = []
-            self.registry.add_scan(
-                ScanAccess(
-                    account_id="*",
-                    region="*",
-                    collector="confluence",
-                    status="error",
-                    scanned_at=self.clock.iso(),
-                    message=f"Catalog load failed. Checks are unknown, not healthy. {exc}",
-                )
-            )
+            self._catalog_message = f"Catalog load failed. Built-in checks still ran. {exc}"
+            if record:
+                self._record_catalog()
             return
         self.catalog_status = "loaded"
         self.catalog_rules = list(catalog.rules)
+        self._catalog_message = f"Loaded Confluence catalog version {catalog.version}."
+        if record:
+            self._record_catalog()
+
+    def _record_catalog(self) -> None:
+        if self.catalog_status == "not-configured":
+            return
+        failed = self.catalog_status != "loaded"
         self.registry.add_scan(
             ScanAccess(
                 account_id="*",
                 region="*",
                 collector="confluence",
-                status="success",
+                status="error" if failed else "success",
                 scanned_at=self.clock.iso(),
-                resource_count=len(catalog.rules),
-                message=f"Loaded Confluence catalog version {catalog.version}.",
+                resource_count=0 if failed else len(self.catalog_rules),
+                message=self._catalog_message or "Catalog load failed. Built-in checks still ran.",
             )
         )
+
+    def _display_seconds(self) -> int:
+        """Five minutes, or one catalog period when a rule's bucket is longer."""
+        periods = [int(getattr(rule, "period_seconds", 0) or 60) for rule in self.catalog_rules]
+        longest = max(periods) if periods else 300
+        return max(300, min(int(self.config.metric_lookback_seconds), longest))
+
+    def _display_diagnoses(self, assessments: list[HealthAssessment]) -> list[Diagnosis]:
+        """Rule text from the health already read. This does not call AWS, Jira, or Gemini."""
+        from sre_agent.diagnosis.agent import Snapshot
+        from sre_agent.diagnosis.rules import diagnose
+
+        by_id = {item.resource_id: item for item in assessments}
+        diagnoses = []
+        for record in self.registry.list_resources():
+            assessment = by_id.get(record.resource_id)
+            if record.presence != "present" or assessment is None:
+                continue
+            relationships = self.registry.dependencies(record.resource_id)
+            neighbors = {}
+            for item in relationships:
+                for related_id in (item.source_id, item.target_id):
+                    related = self.registry.get_by_resource_id(related_id)
+                    if related is not None and related.resource_id != record.resource_id:
+                        neighbors[related.resource_id] = related
+            diagnoses.append(
+                diagnose(
+                    Snapshot(
+                        incident_id=record.resource_id,
+                        record=record,
+                        assessment=assessment,
+                        logs={},
+                        dependencies=relationships,
+                        assessments=by_id,
+                        neighbors=neighbors,
+                        changes=list(record.recent_changes),
+                        lessons=[],
+                        dlq_messages=[],
+                    ),
+                    self.clock.now(),
+                )
+            )
+        return diagnoses
+
+    def _prepare_reader(self, reader, records: list[ResourceRecord], start, end):
+        if reader is None or not hasattr(reader, "query_metrics"):
+            return reader
+        from sre_agent.monitoring.telemetry import prefetched_reader
+
+        rules = [] if self.catalog_status == "failed" else list(self.catalog_rules)
+        try:
+            return prefetched_reader(
+                records,
+                reader,
+                rules,
+                start,
+                end,
+                log_seconds=getattr(self, "_log_window_seconds", None),
+            )
+        except Exception:
+            return reader
 
     def _due_actions(self) -> list[ActionRecord]:
         if getattr(self.clock, "simulated", True):
@@ -561,19 +695,11 @@ class OperationsAgent:
         record = self.registry.get_by_resource_id(resource_id)
         return self._apply_sample(record, start, end, True)
 
-    def _apply_sample(self, record: ResourceRecord, start, end, start_exclusive: bool) -> HealthAssessment:
-        reader = _reader_for(self.scope, record.account_id)
+    def _apply_sample(self, record: ResourceRecord, start, end, start_exclusive: bool, reader=None) -> HealthAssessment:
+        if reader is None:
+            reader = _reader_for(self.scope, record.account_id)
         assessment = sample(record, reader, start, end, start_exclusive)
-        if self.catalog_status == "failed":
-            assessment = HealthAssessment(
-                record.resource_id,
-                "unknown",
-                ["The Confluence catalog failed to load. Missing rules are unknown, not healthy.", *assessment.reasons],
-                list(assessment.missing_signals),
-                dict(assessment.observed_signals),
-                dict(assessment.context),
-            )
-        elif self.catalog_rules and reader is not None:
+        if self.catalog_status != "failed" and self.catalog_rules and reader is not None:
             assessment = apply_catalog(assessment, self.catalog_rules, record, reader, start, end)
         record.health = assessment.state
         record.health_reasons = list(assessment.reasons)
@@ -588,9 +714,28 @@ class OperationsAgent:
         return end - timedelta(seconds=self.config.metric_lookback_seconds), end
 
 
+def _where_line(record: ResourceRecord) -> str:
+    """The checker identity, with the resource name when it is known."""
+    line = record.identity
+    name = str(record.name or "").strip()
+    if name:
+        return f"{line}|{name}"
+    return line
+
+
 def _simulator_mutator(scope: Scope, account_id: str):
     """The in-memory lab may repair itself. A live reader is never used as the mutation client."""
     reader = _reader_for(scope, account_id)
     if reader is not None and reader.__class__.__name__ == "FakeCloud":
         return reader
     return None
+
+
+def _mail_new_ticket(diagnosis: Diagnosis) -> None:
+    """A failed send does not undo the Jira ticket."""
+    try:
+        from sre_agent.demo_mail import ticket_mail
+
+        ticket_mail(diagnosis, diagnosis.jira_issue_key)
+    except Exception:
+        return

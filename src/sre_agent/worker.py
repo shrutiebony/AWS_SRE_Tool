@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import os
 
 from sre_agent.clock import SystemClock
 from sre_agent.models import AgentConfig
@@ -29,15 +28,19 @@ def handler(event, context) -> dict:
 def build_agent() -> OperationsAgent:
     from sre_agent.aws.boto3_reader import Boto3Reader
     from sre_agent.discovery.service import AccountTarget, Scope
+    from sre_agent.local_config import get
     from sre_agent.registry.store import Boto3TableAdapter, Registry
 
-    region = os.environ.get("SRE_REGION", "us-east-2")
-    account_id = os.environ["SRE_ACCOUNT_ID"]
+    region = get("SRE_REGION")
+    account_id = get("SRE_ACCOUNT_ID")
+    table_name = get("SRE_REGISTRY_TABLE")
+    if not region or not account_id or not table_name:
+        raise RuntimeError("Account, region, and registry table come from config.local.json or the process environment.")
     reader = Boto3Reader(
-        role_arn=os.environ.get("SRE_DISCOVERY_ROLE_ARN") or None,
+        role_arn=get("SRE_DISCOVERY_ROLE_ARN") or None,
         region=region,
-        explorer_view_arn=os.environ.get("SRE_EXPLORER_VIEW_ARN") or None,
-        order_table=os.environ.get("SRE_ORDER_TABLE") or None,
+        explorer_view_arn=get("SRE_EXPLORER_VIEW_ARN") or None,
+        order_table=get("SRE_ORDER_TABLE") or None,
     )
     scope = Scope(
         accounts=[
@@ -45,26 +48,25 @@ def build_agent() -> OperationsAgent:
                 account_id=account_id,
                 regions=[region],
                 reader=reader,
-                enable_resource_explorer=bool(os.environ.get("SRE_EXPLORER_VIEW_ARN")),
-                enable_config=os.environ.get("SRE_ENABLE_CONFIG") == "true",
+                enable_resource_explorer=bool(get("SRE_EXPLORER_VIEW_ARN")),
+                enable_config=get("SRE_ENABLE_CONFIG") == "true",
             )
         ]
     )
-    table_name = os.environ["SRE_REGISTRY_TABLE"]
     import boto3
 
     registry = Registry(Boto3TableAdapter(boto3.resource("dynamodb").Table(table_name)))
-    mode = os.environ.get("SRE_MODE", "recommend")
-    approval_mode = os.environ.get("SRE_APPROVAL_MODE", "required")
+    mode = get("SRE_MODE") or "recommend"
+    approval_mode = get("SRE_APPROVAL_MODE") or "required"
     from sre_agent.integrations.secrets import secret_value
 
-    targets = frozenset(item for item in os.environ.get("LAB_TARGETS", "").split(",") if item)
+    targets = frozenset(item for item in get("LAB_TARGETS").split(",") if item)
     config = AgentConfig(
         mode=mode,
         enabled_automatic_runbooks=frozenset(["sqs.redrive_dlq"]) if mode == "automatic" else frozenset(),
         lab_targets=targets,
-        require_approval=os.environ.get("SRE_REQUIRE_APPROVAL", "true") == "true" or approval_mode == "required",
-        approvers=frozenset(item for item in os.environ.get("SRE_APPROVERS", "").split(",") if item),
+        require_approval=(get("SRE_REQUIRE_APPROVAL") or "true") == "true" or approval_mode == "required",
+        approvers=frozenset(item for item in get("SRE_APPROVERS").split(",") if item),
         approval_mode=approval_mode,
         jira_issue_type=secret_value("JIRA_ISSUE_TYPE", "JIRA_SECRET_ARN") or "Task",
         jira_transition=secret_value("JIRA_TRANSITION", "JIRA_SECRET_ARN") or "Done",
@@ -118,7 +120,9 @@ def _jira():
 
 
 def _repair_sender():
-    queue_url = os.environ.get("SRE_EXECUTOR_QUEUE_URL", "")
+    from sre_agent.local_config import get
+
+    queue_url = get("SRE_EXECUTOR_QUEUE_URL")
     if not queue_url:
         return None
 

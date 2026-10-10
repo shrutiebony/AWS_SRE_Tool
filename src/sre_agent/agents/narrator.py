@@ -8,7 +8,6 @@ or an action is discarded.
 from __future__ import annotations
 
 import json
-import os
 from dataclasses import dataclass
 from urllib.error import URLError
 from urllib.request import Request, urlopen
@@ -33,7 +32,9 @@ class Narration:
 def explain(diagnosis: Diagnosis, complete=None) -> Narration:
     before = decision_fingerprint(diagnosis)
     if complete is None:
-        complete = _gemini_complete if os.environ.get("GEMINI_API_KEY", "").strip() else None
+        from sre_agent.local_config import get
+
+        complete = _gemini_complete if get("GEMINI_API_KEY") else None
     if complete is None:
         return Narration(diagnosis.incident_id, _from_rules(diagnosis), "rules")
     rejected = ""
@@ -87,8 +88,12 @@ def _strip_fence(raw: str) -> str:
 
 
 def _gemini_complete(prompt: str) -> str:
-    key = os.environ["GEMINI_API_KEY"].strip()
-    model = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash").strip() or "gemini-2.5-flash"
+    from sre_agent.local_config import get
+
+    key = get("GEMINI_API_KEY")
+    model = get("GEMINI_MODEL")
+    if not key or not model:
+        raise RuntimeError("Gemini key and model come from config.local.json or the process environment.")
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
     request = Request(
         url,

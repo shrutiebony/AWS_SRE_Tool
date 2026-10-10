@@ -62,10 +62,10 @@ def assess(record: ResourceRecord, signals: dict[str, float | None], context: di
         return _assess_api(record, observed, missing, context)
     return HealthAssessment(
         resource_id=record.resource_id,
-        state="unknown",
+        state="degraded",
         reasons=["No monitoring pack is registered for this resource type."],
         missing_signals=missing,
-        context={"pack": "none"},
+        context={"pack": "none", "unreadable": "yes"},
     )
 
 
@@ -81,8 +81,7 @@ def _assess_lambda(record, observed, missing, context) -> HealthAssessment:
     state = "healthy"
     rate = 1.0 if invocations == 0 and errors > 0 else (errors / invocations if invocations else 0.0)
     if invocations == 0 and errors == 0:
-        state = "degraded"
-        reasons.append("The latest period has no invocations, so the consumer is not confirmed to be processing.")
+        reasons.append("No invocations and no errors in the window.")
     elif rate >= 0.05:
         state = "unhealthy"
         reasons.append(f"Error rate is {rate:.0%}.")
@@ -226,12 +225,13 @@ def _assess_api(record, observed, missing, context) -> HealthAssessment:
 
 
 def _unknown(record, missing, context) -> HealthAssessment:
+    names = ", ".join(missing) if missing else "required signals"
     return HealthAssessment(
         resource_id=record.resource_id,
-        state="unknown",
-        reasons=["Required telemetry is missing. Missing telemetry is unknown, not healthy."],
-        missing_signals=missing,
-        context=context,
+        state="degraded",
+        reasons=[f"Could not read {names}."],
+        missing_signals=list(missing),
+        context={**context, "unreadable": "yes"},
     )
 
 

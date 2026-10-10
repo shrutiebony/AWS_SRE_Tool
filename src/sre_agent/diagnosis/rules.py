@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from datetime import datetime, timedelta
 
 from sre_agent.clock import parse_time
@@ -118,14 +119,35 @@ def diagnose(snapshot, now: datetime) -> Diagnosis:
             status="resolved",
             evidence=_signal_evidence(assessment),
         )
-    if assessment.state == "unknown" or record.monitoring_status == "unsupported":
+    catalog_reasons = [reason for reason in assessment.reasons if "catalog rule" in reason.lower()]
+    if catalog_reasons:
         return _diagnosis(
             snapshot,
-            problem="Required telemetry is missing, so health is unknown.",
-            code="telemetry.missing",
-            health="unknown",
+            problem=plain_catalog_issue(catalog_reasons),
+            code="catalog.symptom",
+            health=_shown_state(assessment.state),
             status="unresolved",
-            uncertainty=list(assessment.missing_signals),
+            uncertainty=_catalog_gaps(catalog_reasons),
+            evidence=_signal_evidence(assessment),
+        )
+    if assessment.context.get("unreadable") == "yes" or assessment.state not in {"healthy", "degraded", "unhealthy"}:
+        named = [item for item in assessment.missing_signals if item]
+        if assessment.context.get("pack") == "none":
+            return _diagnosis(
+                snapshot,
+                problem="No monitoring pack is registered for this resource type.",
+                code="monitoring.unsupported",
+                health="degraded",
+                status="unresolved",
+                evidence=_signal_evidence(assessment),
+            )
+        return _diagnosis(
+            snapshot,
+            problem=plain_missing_issue(named),
+            code="signal.missing",
+            health="degraded" if assessment.state not in {"degraded", "unhealthy"} else assessment.state,
+            status="unresolved",
+            uncertainty=list(named),
             evidence=_signal_evidence(assessment),
         )
     if record.resource_type == "sqs:queue":
@@ -134,16 +156,6 @@ def diagnose(snapshot, now: datetime) -> Diagnosis:
         return _diagnose_lambda(snapshot, now)
     if record.resource_type == "ec2:instance":
         return _diagnose_ec2(snapshot)
-    catalog_reasons = [reason for reason in assessment.reasons if reason.startswith("Catalog rule")]
-    if catalog_reasons:
-        return _diagnosis(
-            snapshot,
-            problem=catalog_reasons[0],
-            code="catalog.symptom",
-            health=assessment.state,
-            status="unresolved",
-            evidence=_signal_evidence(assessment),
-        )
     return _diagnosis(
         snapshot,
         problem="Monitoring is not supported for this resource type.",
@@ -361,14 +373,168 @@ def _diagnosis(snapshot, problem, code, health, status, evidence=None, causes=No
     )
 
 
+def plain_missing_issue(names: list[str]) -> str:
+    """A missing signal is its own problem. The title is never the word unknown."""
+    cleaned = [str(item).strip() for item in names if str(item).strip() and str(item).strip().lower() != "unknown"]
+    if not cleaned:
+        return "Required telemetry is missing."
+    return f"Required telemetry is missing: {', '.join(cleaned)}."
+
+
+def plain_catalog_issue(reasons: list[str]) -> str:
+    """Plain-language catalog problem. Measured values and repeated errors stay out of the title."""
+    blob = " ".join(reasons)
+    rule = _rule_id(blob)
+    placeholders = _placeholder_names(blob)
+    if placeholders or "unresolved placeholder" in blob.lower() or "has no value" in blob.lower():
+        if rule and placeholders:
+            return f"Catalog rule {rule} cannot be evaluated because {', '.join(placeholders)} has no value."
+        if rule:
+            return f"Catalog rule {rule} cannot be evaluated because a placeholder has no value."
+        if placeholders:
+            return f"A catalog placeholder has no value: {', '.join(placeholders)}."
+        return "A catalog rule cannot be evaluated because a placeholder has no value."
+    missing = _missing_signal_names(blob)
+    if missing:
+        return plain_missing_issue(missing)
+    breaches = _breach_pairs(blob)
+    if breaches:
+        sentences = []
+        for rule_id, signal in breaches:
+            sentence = f"Catalog rule {rule_id} shows {signal} outside its threshold."
+            if sentence not in sentences:
+                sentences.append(sentence)
+        return " ".join(sentences)
+    if rule:
+        return f"Catalog rule {rule} is failing."
+    return "A catalog rule is failing."
+
+
+def problem_identity_text(problem_code: str, text: str, missing: list[str] | None = None) -> str:
+    """Identity of one problem. Account, region, and resource are not part of it."""
+    blob = text or ""
+    rule = _rule_id(blob)
+    placeholders = _placeholder_names(blob)
+    if placeholders or "unresolved placeholder" in blob.lower() or "has no value" in blob.lower():
+        if rule:
+            return f"catalog.placeholder.{rule}"
+        if placeholders:
+            return "catalog.placeholder." + "+".join(placeholders)
+        return "catalog.placeholder"
+    names = _signal_list(missing or []) or _missing_signal_names(blob)
+    missing_problem = problem_code == "signal.missing" or "required telemetry is missing" in blob.lower()
+    read_failure = blob.lower().startswith("could not read") and "catalog rule" not in blob.lower()
+    if missing_problem or read_failure or (names and "could not read" in blob.lower() and not rule):
+        if names:
+            return "signal.missing." + "+".join(names)
+        if missing_problem or read_failure:
+            return "signal.missing"
+    breaches = _breach_pairs(blob)
+    if breaches:
+        return "catalog.breach." + "+".join(rule_id for rule_id, _signal in breaches)
+    if "outside its threshold" in blob.lower() and rule:
+        return f"catalog.breach.{rule}"
+    if problem_code == "catalog.symptom" and rule:
+        return f"catalog.symptom.{rule}"
+    return problem_code or "unspecified"
+
+
+def _rule_id(text: str) -> str:
+    match = re.search(r"catalog rule\s+([A-Za-z0-9_.-]+)", text or "", flags=re.IGNORECASE)
+    return match.group(1) if match else ""
+
+
+def _placeholder_names(text: str) -> list[str]:
+    names = re.findall(r"\$\{([A-Za-z0-9_]+)\}", text or "")
+    for name in re.findall(r"because\s+([A-Za-z_][A-Za-z0-9_]*)\s+has no value", text or "", flags=re.IGNORECASE):
+        if name.lower() not in {"a", "the"}:
+            names.append(name)
+    return sorted(set(names), key=str.lower)
+
+
+def _missing_signal_names(text: str) -> list[str]:
+    found: list[str] = []
+    for match in re.finditer(
+        r"Could not read ([A-Za-z0-9_.:]+) for catalog rule",
+        text or "",
+        flags=re.IGNORECASE,
+    ):
+        found.append(match.group(1))
+    prose = re.search(
+        r"Required telemetry is missing:?\s+([A-Za-z0-9_.:]+(?:\s*,\s*[A-Za-z0-9_.:]+)*)",
+        text or "",
+        flags=re.IGNORECASE,
+    )
+    if prose:
+        found.extend(part.strip() for part in prose.group(1).split(","))
+    if not found and not re.search(r"could not read catalog rule", text or "", flags=re.IGNORECASE):
+        generic = re.search(r"Could not read ([A-Za-z0-9_.:]+(?:\s*,\s*[A-Za-z0-9_.:]+)*)", text or "", flags=re.IGNORECASE)
+        if generic:
+            found.extend(part.strip() for part in generic.group(1).split(","))
+    return _signal_list(found)
+
+
+def _breach_pairs(text: str) -> list[tuple[str, str]]:
+    pairs = []
+    seen = set()
+    pattern = re.compile(
+        r"Catalog rule ([A-Za-z0-9_.-]+)(?:\s+v\d+)?:\s+([A-Za-z0-9_.:]+)\s+is\s+-?\d",
+        flags=re.IGNORECASE,
+    )
+    for match in pattern.finditer(text or ""):
+        pair = (match.group(1), match.group(2))
+        if pair not in seen:
+            seen.add(pair)
+            pairs.append(pair)
+    if pairs:
+        return pairs
+    prose = re.finditer(
+        r"Catalog rule ([A-Za-z0-9_.-]+) shows ([A-Za-z0-9_.:]+) outside its threshold",
+        text or "",
+        flags=re.IGNORECASE,
+    )
+    for match in prose:
+        pair = (match.group(1), match.group(2))
+        if pair not in seen:
+            seen.add(pair)
+            pairs.append(pair)
+    return pairs
+
+
+def _signal_list(names: list[str]) -> list[str]:
+    cleaned = []
+    for item in names:
+        token = str(item).strip().rstrip(".")
+        if re.fullmatch(r"[A-Za-z][A-Za-z0-9_.:]*", token) and token.lower() != "unknown":
+            if token not in cleaned:
+                cleaned.append(token)
+    return sorted(cleaned, key=str.lower)
+
+
+def _catalog_gaps(reasons: list[str]) -> list[str]:
+    blob = " ".join(reasons)
+    gaps = list(_placeholder_names(blob))
+    for name in _missing_signal_names(blob):
+        if name not in gaps:
+            gaps.append(name)
+    return gaps
+
+
+def _shown_state(state: str) -> str:
+    if state in {"healthy", "degraded", "unhealthy"}:
+        return state
+    return "degraded"
+
+
 def _signal_evidence(assessment) -> list[Evidence]:
+    state = _shown_state(assessment.state)
     return [
         Evidence(
             id="ev-signals",
             source="cloudwatch",
-            summary=f"Health is {assessment.state}. " + " ".join(assessment.reasons),
+            summary=f"Health is {state}. " + " ".join(assessment.reasons),
             data={
-                "state": assessment.state,
+                "state": state,
                 "signals": assessment.observed_signals,
                 "missing": assessment.missing_signals,
                 "reasons": assessment.reasons,

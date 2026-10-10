@@ -9,7 +9,6 @@ variables is set, both Confluence and Jira use that secret.
 from __future__ import annotations
 
 import json
-import os
 
 _PARTNER_ARN = {
     "CONFLUENCE_SECRET_ARN": "JIRA_SECRET_ARN",
@@ -34,7 +33,9 @@ _SETTING_KEYS = {
 
 
 def secret_value(name: str, arn_name: str = "", arn: str = "") -> str:
-    direct = os.environ.get(name, "").strip()
+    from sre_agent.local_config import get
+
+    direct = get(name)
     if direct:
         return direct
     secret_arn = arn.strip() if arn else ""
@@ -52,13 +53,15 @@ def secret_value(name: str, arn_name: str = "", arn: str = "") -> str:
 
 
 def _resolve_arn(arn_name: str) -> str:
-    primary = os.environ.get(arn_name, "").strip()
+    from sre_agent.local_config import get
+
+    primary = get(arn_name)
     if primary:
         return primary
     partner = _PARTNER_ARN.get(arn_name, "")
     if not partner:
         return ""
-    return os.environ.get(partner, "").strip()
+    return get(partner)
 
 
 def _parsed_secret(secret_arn: str) -> dict | str:

@@ -105,19 +105,43 @@ class HttpConfluence:
         self.token = token
 
     def fetch_page(self) -> tuple[int, str]:
-        url = f"{self.base_url}/wiki/api/v2/pages/{self.page_id}?body-format=storage"
-        request = urllib.request.Request(url)
+        version, _title, storage, _space = self.fetch_document()
+        return version, storage
+
+    def fetch_document(self) -> tuple[int, str, str, str]:
+        payload = self._request("GET", f"/wiki/api/v2/pages/{self.page_id}?body-format=storage")
+        version = int((payload.get("version") or {}).get("number") or 0)
+        title = str(payload.get("title") or "")
+        storage = ((payload.get("body") or {}).get("storage") or {}).get("value") or ""
+        space_id = str(payload.get("spaceId") or "")
+        return version, title, storage, space_id
+
+    def write_storage(self, title: str, storage: str, version: int, space_id: str = "") -> None:
+        """Append-only callers pass the previous storage plus the new section."""
+        body = {
+            "id": str(self.page_id),
+            "status": "current",
+            "title": title,
+            "body": {"representation": "storage", "value": storage},
+            "version": {"number": int(version) + 1, "message": "Add a service section"},
+        }
+        if space_id:
+            body["spaceId"] = space_id
+        self._request("PUT", f"/wiki/api/v2/pages/{self.page_id}", body)
+
+    def _request(self, method: str, path: str, body: dict | None = None) -> dict:
+        data = None if body is None else json.dumps(body).encode()
+        request = urllib.request.Request(self.base_url + path, data=data, method=method)
         token = f"{self.email}:{self.token}".encode()
         request.add_header("Authorization", "Basic " + _b64(token))
         request.add_header("Accept", "application/json")
+        request.add_header("Content-Type", "application/json")
         try:
-            with urllib.request.urlopen(request, timeout=10) as response:
-                payload = json.loads(response.read().decode())
+            with urllib.request.urlopen(request, timeout=20) as response:
+                raw = response.read().decode()
         except Exception as exc:
             raise ConfluenceError(str(exc)) from exc
-        version = int((payload.get("version") or {}).get("number") or 0)
-        storage = ((payload.get("body") or {}).get("storage") or {}).get("value") or ""
-        return version, storage
+        return json.loads(raw) if raw else {}
 
 
 def load_catalog(client, page_id: str = "", services: list | None = None) -> Catalog:
@@ -228,7 +252,7 @@ def _symptom_rules(
         if not any(_clean(cell) for cell in row):
             continue
         values = {name: _clean(row[position]) if position < len(row) else "" for name, position in index.items()}
-        if not values["Status"].lower().startswith("active"):
+        if not re.search(r"\bactive\b", values["Status"].lower()):
             continue
         kind = values.get("Type", "metric")
         namespace = values.get("Namespace / log group", "")
@@ -337,6 +361,180 @@ def _fill(template: str, values: dict[str, str]) -> str:
 
     filled = re.sub(r"\$\{([A-Za-z0-9_]+)\}", replace, template)
     return re.sub(r"\{([A-Za-z_][A-Za-z0-9_]*)\}", replace, filled)
+
+
+WORKLOAD_COLUMNS = (
+    "Symptom ID",
+    "Scenario IDs",
+    "Type",
+    "Namespace / log group",
+    "Dimension",
+    "Metric / query",
+    "Stat",
+    "Condition",
+    "Threshold",
+    "Window (min)",
+    "Role",
+    "Status",
+)
+_CODE_COLUMNS = {"Namespace / log group", "Dimension", "Metric / query", "Threshold"}
+_WORKLOAD_CONDITIONS = {">", ">=", "<"}
+_WORKLOAD_KINDS = {"metric", "log"}
+_WORKLOAD_ROLES = {"primary", "supporting"}
+_WORKLOAD_STATS = {"Sum", "Average", "Maximum", "Minimum", "Count"}
+
+
+def service_heading(service: str, resource_type: str) -> str:
+    return f"Service: {service} ({resource_type})"
+
+
+def storage_has_service(storage: str, service: str, resource_type: str) -> bool:
+    target = service_heading(service, resource_type).lower()
+    for heading in re.findall(r"<h2\b[^>]*>(.*?)</h2>", storage or "", flags=re.IGNORECASE | re.DOTALL):
+        if _clean(heading).lower() == target:
+            return True
+    return False
+
+
+def validate_workload_fields(fields: dict) -> str:
+    """Return an error sentence, or empty when the form can be written."""
+    service = str(fields.get("service") or "").strip()
+    resource_type = str(fields.get("resource_type") or "").strip()
+    measure = str(fields.get("measure") or "").strip()
+    dimension = str(fields.get("dimension") or "").strip()
+    stat = str(fields.get("stat") or "").strip()
+    window = str(fields.get("window") or "").strip()
+    role = str(fields.get("role") or "").strip()
+    if not service:
+        return "Service name is required."
+    if not re.fullmatch(r"[A-Za-z0-9_-]+:[A-Za-z0-9_-]+", resource_type):
+        return "Resource type must look like eks:cluster."
+    if not measure:
+        return "What to measure is required."
+    if "=" not in dimension:
+        return "Dimension must look like Name=Value."
+    if stat not in _WORKLOAD_STATS:
+        return "Stat must be Sum, Average, Maximum, Minimum, or Count."
+    if not re.fullmatch(r"[1-9][0-9]*", window):
+        return "Window in minutes must be a positive whole number."
+    if role not in _WORKLOAD_ROLES:
+        return "Role must be primary or supporting."
+    rows = _condition_rows(fields)
+    if not rows:
+        return "At least one condition is required."
+    for number, row in enumerate(rows, start=1):
+        error = _condition_error(row)
+        if error:
+            return f"Condition {number}: {error}"
+    return ""
+
+
+def workload_section(fields: dict, storage: str) -> str:
+    """One service heading and one symptom table, in the page's storage format."""
+    service = str(fields.get("service") or "").strip()
+    resource_type = str(fields.get("resource_type") or "").strip()
+    measure = str(fields.get("measure") or "").strip()
+    dimension = str(fields.get("dimension") or "").strip()
+    stat = str(fields.get("stat") or "").strip()
+    window = str(fields.get("window") or "").strip()
+    role = str(fields.get("role") or "").strip()
+    rows = _condition_rows(fields)
+    given = str(fields.get("symptom_id") or "").strip()
+    seen = storage or ""
+    body_rows = []
+    for index, row in enumerate(rows):
+        if index == 0 and given:
+            symptom = given
+        else:
+            symptom = _next_symptom_id(service, seen)
+        seen += "\n" + symptom
+        values = {
+            "Symptom ID": symptom,
+            "Scenario IDs": "",
+            "Type": str(row.get("kind") or "").strip(),
+            "Namespace / log group": str(row.get("namespace") or "").strip(),
+            "Dimension": dimension,
+            "Metric / query": measure,
+            "Stat": stat,
+            "Condition": str(row.get("condition") or "").strip(),
+            "Threshold": str(row.get("threshold") or "").strip(),
+            "Window (min)": window,
+            "Role": role,
+        }
+        cells = "".join(_storage_cell(name, values[name]) for name in WORKLOAD_COLUMNS if name != "Status")
+        cells += _status_cell()
+        body_rows.append(f"<tr>{cells}</tr>")
+    header = "".join(f"<th><p>{html.escape(name)}</p></th>" for name in WORKLOAD_COLUMNS)
+    heading = html.escape(service_heading(service, resource_type))
+    table = (
+        '<table data-table-width="1800" data-layout="full-width"><tbody>'
+        f"<tr>{header}</tr>{''.join(body_rows)}</tbody></table>"
+    )
+    return f"<h2>{heading}</h2><h3>Symptoms</h3>{table}"
+
+
+def _condition_rows(fields: dict) -> list[dict]:
+    raw = fields.get("conditions")
+    if isinstance(raw, list):
+        rows = [item for item in raw if isinstance(item, dict)]
+        return [row for row in rows if _condition_present(row)]
+    if _condition_present(fields):
+        return [
+            {
+                "condition": fields.get("condition"),
+                "threshold": fields.get("threshold"),
+                "kind": fields.get("kind"),
+                "namespace": fields.get("namespace"),
+            }
+        ]
+    return []
+
+
+def _condition_present(row: dict) -> bool:
+    return any(str(row.get(name) or "").strip() for name in ("condition", "threshold", "kind", "namespace"))
+
+
+def _condition_error(row: dict) -> str:
+    condition = str(row.get("condition") or "").strip()
+    threshold = str(row.get("threshold") or "").strip()
+    kind = str(row.get("kind") or "").strip()
+    namespace = str(row.get("namespace") or "").strip()
+    if condition not in _WORKLOAD_CONDITIONS:
+        return "Condition must be >, >=, or <."
+    if not threshold:
+        return "Threshold is required."
+    if kind not in _WORKLOAD_KINDS:
+        return "Type must be metric or log."
+    if not namespace:
+        return "Namespace or log group is required."
+    return ""
+
+
+def _storage_cell(name: str, value: str) -> str:
+    escaped = html.escape(value)
+    body = f"<code>{escaped}</code>" if name in _CODE_COLUMNS else escaped
+    return f"<td><p>{body}</p></td>"
+
+
+def _status_cell() -> str:
+    macro = (
+        '<ac:structured-macro ac:name="status" ac:schema-version="1">'
+        '<ac:parameter ac:name="colour">Green</ac:parameter>'
+        '<ac:parameter ac:name="title">Active</ac:parameter>'
+        "</ac:structured-macro>"
+    )
+    return f"<td><p>{macro}</p></td>"
+
+
+def _next_symptom_id(service: str, storage: str) -> str:
+    base = re.sub(r"[^A-Za-z0-9]+", "", service).upper() or "SVC"
+    text = storage or ""
+    number = 1
+    while True:
+        candidate = f"{base}-S{number:02d}"
+        if candidate not in text:
+            return candidate
+        number += 1
 
 
 def _b64(raw: bytes) -> str:

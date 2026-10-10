@@ -3,13 +3,23 @@
 from __future__ import annotations
 
 import json
+import threading
 from datetime import datetime
 
 from sre_agent.aws.errors import NotFound, SourceNotConfigured, map_exception
 from sre_agent.aws.names import log_group_for, metric_identity, parse_arn, resource_name
 from sre_agent.aws.paging import Page
 
-COUNTERS = {"Errors", "Invocations", "Throttles"}
+COUNTERS = {
+    "Errors",
+    "Invocations",
+    "Throttles",
+    "5XXError",
+    "Count",
+    "ReadThrottleEvents",
+    "WriteThrottleEvents",
+    "UserErrors",
+}
 
 
 class Boto3Reader:
@@ -23,6 +33,7 @@ class Boto3Reader:
     ) -> None:
         try:
             import boto3
+            from botocore.config import Config
         except ImportError as exc:
             raise RuntimeError("boto3 is required for live AWS reads. Install the aws extra.") from exc
         self._boto3 = boto3
@@ -31,18 +42,28 @@ class Boto3Reader:
         self.region = region
         self._expires = None
         self.session = self._base_session
+        self._client_lock = threading.RLock()
+        self._clients: dict[tuple[str, str], object] = {}
+        self._config = Config(
+            retries={"total_max_attempts": 2, "mode": "standard"},
+            connect_timeout=3,
+            read_timeout=12,
+            max_pool_connections=32,
+        )
         if role_arn:
             self._refresh_credentials(force=True)
         self.explorer_view_arn = explorer_view_arn
         self.order_table = order_table
-        self._clients: dict[tuple[str, str], object] = {}
 
     def client(self, service: str, region: str):
         self._refresh_credentials()
         key = (service, region)
-        if key not in self._clients:
-            self._clients[key] = self.session.client(service, region_name=region)
-        return self._clients[key]
+        with self._client_lock:
+            cached = self._clients.get(key)
+            if cached is None:
+                cached = self.session.client(service, region_name=region, config=self._config)
+                self._clients[key] = cached
+            return cached
 
     def list_functions_page(self, account_id: str, region: str, token: str | None, page_size: int) -> Page:
         del account_id
@@ -58,27 +79,34 @@ class Boto3Reader:
 
     def get_function(self, account_id: str, region: str, name: str) -> dict:
         client = self.client("lambda", region)
-        response = self._invoke(lambda: client.get_function(FunctionName=name))
+
+        def configuration():
+            return self._invoke(lambda: client.get_function(FunctionName=name))
+        def mappings_for() -> list[dict]:
+            found: list[dict] = []
+            marker = None
+            while True:
+                kwargs = {"FunctionName": name}
+                if marker:
+                    kwargs["Marker"] = marker
+                page = self._invoke(lambda kwargs=kwargs: client.list_event_source_mappings(**kwargs))
+                for item in page.get("EventSourceMappings", []):
+                    found.append(
+                        {
+                            "uuid": item.get("UUID", ""),
+                            "event_source_arn": item.get("EventSourceArn", ""),
+                            "state": item.get("State", ""),
+                            "batch_size": item.get("BatchSize", 0),
+                        }
+                    )
+                marker = page.get("NextMarker")
+                if not marker:
+                    return found
+
+        from sre_agent.aws.parallel import parallel_map
+
+        response, mappings = parallel_map(lambda fn: fn(), [configuration, mappings_for])
         configuration = response["Configuration"]
-        mappings: list[dict] = []
-        marker = None
-        while True:
-            kwargs = {"FunctionName": name}
-            if marker:
-                kwargs["Marker"] = marker
-            page = self._invoke(lambda kwargs=kwargs: client.list_event_source_mappings(**kwargs))
-            for item in page.get("EventSourceMappings", []):
-                mappings.append(
-                    {
-                        "uuid": item.get("UUID", ""),
-                        "event_source_arn": item.get("EventSourceArn", ""),
-                        "state": item.get("State", ""),
-                        "batch_size": item.get("BatchSize", 0),
-                    }
-                )
-            marker = page.get("NextMarker")
-            if not marker:
-                break
         return {
             "resource_id": configuration["FunctionArn"],
             "account_id": account_id,
@@ -114,13 +142,20 @@ class Boto3Reader:
 
     def get_queue_by_url(self, account_id: str, region: str, url: str) -> dict:
         client = self.client("sqs", region)
-        attributes = self._invoke(
-            lambda: client.get_queue_attributes(QueueUrl=url, AttributeNames=["All"])
-        )["Attributes"]
-        try:
-            tags = self._invoke(lambda: client.list_queue_tags(QueueUrl=url)).get("Tags", {})
-        except NotFound:
-            tags = {}
+        wanted = ["QueueArn", "VisibilityTimeout", "RedrivePolicy", "ApproximateNumberOfMessages"]
+
+        def attributes_for():
+            return self._invoke(lambda: client.get_queue_attributes(QueueUrl=url, AttributeNames=wanted))["Attributes"]
+
+        def tags_for():
+            try:
+                return self._invoke(lambda: client.list_queue_tags(QueueUrl=url)).get("Tags", {})
+            except NotFound:
+                return {}
+
+        from sre_agent.aws.parallel import parallel_map
+
+        attributes, tags = parallel_map(lambda fn: fn(), [attributes_for, tags_for])
         policy = attributes.get("RedrivePolicy")
         return {
             "resource_id": attributes["QueueArn"],
@@ -173,43 +208,59 @@ class Boto3Reader:
                 dimensions = mapped_dimensions
         if not namespace or not dimensions:
             return {name: [] for name in metric_names}
-        queries = []
-        for index, name in enumerate(metric_names):
-            queries.append(
+        queries = [
+            {
+                "id": f"m{index}",
+                "namespace": namespace,
+                "metric_name": name,
+                "dimensions": dimensions,
+                "period": period or 60,
+                "stat": _cloudwatch_stat(stat, name),
+            }
+            for index, name in enumerate(metric_names)
+        ]
+        found = self.query_metrics(region, queries, start, end)
+        return {name: found.get(f"m{index}", []) for index, name in enumerate(metric_names)}
+
+    def query_metrics(self, region: str, queries: list[dict], start: datetime, end: datetime) -> dict[str, list]:
+        """One GetMetricData for many resources. Each query needs id, namespace, metric_name, dimensions, period, and stat."""
+        if not queries:
+            return {}
+        found: dict[str, list] = {str(item["id"]): [] for item in queries}
+        for offset in range(0, len(queries), 100):
+            chunk = queries[offset : offset + 100]
+            payload = [
                 {
-                    "Id": f"m{index}",
+                    "Id": str(item["id"]),
                     "MetricStat": {
-                        "Metric": {"Namespace": namespace, "MetricName": name, "Dimensions": dimensions},
-                        "Period": period or 60,
-                        "Stat": _cloudwatch_stat(stat, name),
+                        "Metric": {
+                            "Namespace": item["namespace"],
+                            "MetricName": item["metric_name"],
+                            "Dimensions": item["dimensions"],
+                        },
+                        "Period": int(item.get("period") or 60),
+                        "Stat": item["stat"],
                     },
                     "ReturnData": True,
                 }
-            )
-        results = []
-        token = None
-        while True:
-            kwargs = {"MetricDataQueries": queries, "StartTime": start, "EndTime": end}
-            if token:
-                kwargs["NextToken"] = token
-            response = self._invoke(lambda kwargs=kwargs: self.client("cloudwatch", region).get_metric_data(**kwargs))
-            results.extend(response.get("MetricDataResults", []))
-            token = response.get("NextToken")
-            if not token:
-                break
-        by_id = {}
-        for item in results:
-            current = by_id.setdefault(item["Id"], {"Timestamps": [], "Values": []})
-            current["Timestamps"].extend(item.get("Timestamps", []))
-            current["Values"].extend(item.get("Values", []))
-        result = {}
-        for index, name in enumerate(metric_names):
-            item = by_id.get(f"m{index}", {})
-            points = []
-            for stamp, value in zip(item.get("Timestamps", []), item.get("Values", [])):
-                points.append((stamp, float(value)))
-            result[name] = points
-        return result
+                for item in chunk
+            ]
+            token = None
+            while True:
+                kwargs = {"MetricDataQueries": payload, "StartTime": start, "EndTime": end}
+                if token:
+                    kwargs["NextToken"] = token
+                response = self._invoke(lambda kwargs=kwargs: self.client("cloudwatch", region).get_metric_data(**kwargs))
+                for item in response.get("MetricDataResults", []):
+                    points = found.setdefault(item["Id"], [])
+                    points.extend(
+                        (stamp, float(value))
+                        for stamp, value in zip(item.get("Timestamps", []), item.get("Values", []))
+                    )
+                token = response.get("NextToken")
+                if not token:
+                    break
+        return found
 
     def filter_logs(self, account_id, region, resource_id, start: datetime, end: datetime) -> list[dict]:
         del account_id
@@ -264,7 +315,10 @@ class Boto3Reader:
         raise NotFound(resource_id)
 
     def caller_account(self) -> str:
-        response = self._invoke(lambda: self.client("sts", self.region or "us-east-1").get_caller_identity())
+        from sre_agent.local_config import get
+
+        region = self.region or get("SRE_REGION") or get("AWS_REGION")
+        response = self._invoke(lambda: self.client("sts", region).get_caller_identity())
         return response["Account"]
 
     def list_tagged_resources(self, account_id: str, region: str, resource_type: str) -> list[dict]:
@@ -505,21 +559,43 @@ class Boto3Reader:
         return Page(items=items, next_token=response.get("position"))
 
     def get_rest_api(self, account_id: str, region: str, name: str) -> dict:
-        api = self._invoke(lambda: self.client("apigateway", region).get_rest_api(restApiId=name))
+        from sre_agent.aws.parallel import parallel_map
+
+        def api_for():
+            return self._invoke(lambda: self.client("apigateway", region).get_rest_api(restApiId=name))
+
+        def resources_for():
+            return self._invoke(lambda: self.client("apigateway", region).get_resources(restApiId=name, limit=500))
+
+        def stages_for() -> list[str]:
+            try:
+                return self.rest_api_stages(region, name)
+            except Exception:
+                return []
+
+        api, resources, stages = parallel_map(lambda fn: fn(), [api_for, resources_for, stages_for])
         integrations = []
-        resources = self._invoke(lambda: self.client("apigateway", region).get_resources(restApiId=name, limit=100))
-        for item in resources.get("items", []):
-            for method in item.get("resourceMethods") or {}:
-                detail = self._invoke(
-                    lambda method=method, resource_id=item["id"]: self.client("apigateway", region).get_method(
-                        restApiId=name, resourceId=resource_id, httpMethod=method
-                    )
+        pairs = [
+            (item, method)
+            for item in resources.get("items", [])
+            for method in (item.get("resourceMethods") or {})
+        ]
+
+        def fetch(pair: tuple[dict, str]) -> tuple[dict, str, dict]:
+            item, method = pair
+            detail = self._invoke(
+                lambda item=item, method=method: self.client("apigateway", region).get_method(
+                    restApiId=name, resourceId=item["id"], httpMethod=method
                 )
-                uri = (detail.get("methodIntegration") or {}).get("uri", "")
-                marker = "/functions/"
-                if marker in uri:
-                    lambda_arn = uri.split(marker, 1)[1].split("/invocations", 1)[0]
-                    integrations.append({"method": method, "path": item.get("path", ""), "lambda_arn": lambda_arn})
+            )
+            return item, method, detail
+
+        for item, method, detail in (fetch(pair) for pair in pairs):
+            uri = (detail.get("methodIntegration") or {}).get("uri", "")
+            marker = "/functions/"
+            if marker in uri:
+                lambda_arn = uri.split(marker, 1)[1].split("/invocations", 1)[0]
+                integrations.append({"method": method, "path": item.get("path", ""), "lambda_arn": lambda_arn})
         return {
             "resource_id": f"arn:aws:apigateway:{region}::/restapis/{name}",
             "account_id": account_id,
@@ -527,8 +603,12 @@ class Boto3Reader:
             "resource_type": "apigateway:restapi",
             "name": api.get("name") or name,
             "tags": api.get("tags") or {},
-            "config": {"api_id": name, "integrations": integrations},
+            "config": {"api_id": name, "stages": stages, "integrations": integrations},
         }
+
+    def rest_api_stages(self, region: str, api_id: str) -> list[str]:
+        response = self._invoke(lambda: self.client("apigateway", region).get_stages(restApiId=api_id))
+        return [str(item.get("stageName")) for item in response.get("item", []) if item.get("stageName")]
 
     def run_logs_query(self, account_id, region, resource_id, query, start: datetime, end: datetime, log_group: str | None = None) -> list[dict]:
         from sre_agent.aws.errors import CloudError
@@ -612,8 +692,11 @@ class Boto3Reader:
             return
         if not force and self._expires is not None and self._expires - datetime.now(timezone.utc) > timedelta(minutes=5):
             return
-        self.session, self._expires = _assumed_session(self._boto3, self._base_session, self.role_arn, self.region)
-        self._clients.clear()
+        session, expires = _assumed_session(self._boto3, self._base_session, self.role_arn, self.region)
+        with self._client_lock:
+            self.session = session
+            self._expires = expires
+            self._clients.clear()
 
     def _instance_statuses(self, region: str, instance_ids: list[str]) -> dict[str, str]:
         if not instance_ids:
@@ -642,6 +725,21 @@ class Boto3Reader:
             if mapped is not None:
                 raise mapped from exc
             raise
+
+
+def metric_key(resource_id: str, name: str, stat: str | None, period: int | None, namespace: str | None, dimensions: list | None) -> tuple:
+    """Identity of one CloudWatch series, matching get_metric_data's defaults."""
+    if not namespace or not dimensions:
+        try:
+            mapped_namespace, mapped_dimensions = metric_identity(resource_id)
+        except ValueError:
+            mapped_namespace, mapped_dimensions = "", []
+        if not namespace:
+            namespace = mapped_namespace
+        if not dimensions:
+            dimensions = mapped_dimensions
+    dims = tuple((str(item.get("Name")), str(item.get("Value"))) for item in (dimensions or []))
+    return (resource_id, name, _cloudwatch_stat(stat, name), int(period or 60), namespace or "", dims)
 
 
 def _cloudwatch_stat(stat: str | None, metric_name: str) -> str:

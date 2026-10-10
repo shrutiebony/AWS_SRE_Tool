@@ -51,6 +51,11 @@
     .ghost { background: transparent; color: var(--ink); border-radius: 999px; min-height: 60px; padding: 0 22px; border: 1px solid var(--line); }
     .reset { background: white; border: 1px solid var(--line); border-radius: 999px; min-height: 52px; padding: 0 20px; font-size: 17px; }
     footer { margin-top: 28px; color: var(--muted); font-size: 16px; }
+    .mail-box { margin-top: 18px; max-width: 720px; }
+    .mail-box label { display: block; font-weight: 650; margin-bottom: 8px; }
+    .mail-box textarea { width: 100%; min-height: 84px; font: inherit; padding: 10px 12px; border-radius: 12px; border: 1px solid var(--line); }
+    .mail-box button { margin-top: 10px; }
+    .mail-box p { margin: 8px 0 0; color: var(--muted); font-size: 16px; }
     .overlay { position: fixed; inset: 0; background: rgba(16, 24, 20, 0.46); display: none; align-items: center; justify-content: center; padding: 28px; }
     .overlay.open { display: flex; }
     .modal { width: min(760px, 100%); background: var(--card); color: var(--ink); border-radius: 32px; padding: 40px 42px 32px; box-shadow: var(--shadow); }
@@ -84,10 +89,17 @@
   <div class="page">
     <header>
       <div>
-        <p class="eyebrow">Live demo · us-east-2</p>
+        <p class="eyebrow" id="region-label">Live demo</p>
         <h1>SRE health checker</h1>
         <p class="lede">Three stories, told by clicking. Each result opens here, with the live reading and whether the mail went out.</p>
         <div class="banner" id="banner">Checking the catalog and mail path…</div>
+        <div class="mail-box">
+          <label for="mail-addresses">Send results to these addresses</label>
+          <textarea id="mail-addresses" name="mail-addresses"></textarea>
+          <button class="reset" id="save-emails" type="button">Save addresses</button>
+          <p id="ses-note">Amazon SES sends from the verified From address in the local config. In the sandbox, each recipient must be verified too.</p>
+          <p id="email-status"></p>
+        </div>
       </div>
       <button class="reset" id="reset" type="button">Reset / clean</button>
     </header>
@@ -111,7 +123,7 @@
         <button class="begin" type="button" data-flow="service">Begin</button>
       </article>
     </div>
-    <footer>Account 414279120882 · recommend mode · repairs off · inventory can take a few minutes and this page stays on the step that is running.</footer>
+    <footer id="footer">Recommend mode · repairs off · inventory can take a few minutes and this page stays on the step that is running.</footer>
   </div>
   <div class="overlay" id="overlay">
     <div class="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title">
@@ -133,7 +145,7 @@
       add: {
         name: "Addition and deletion",
         stages: [
-          { title: "Add a table", narration: "This creates demo-extra-sites in us-east-2 and asks the checker to inventory the account.", button: "Create the table", action: "demo1_create" },
+          { title: "Add a table", narration: "Review the plan, then verify before anything changes.", button: "Verify and apply", action: "demo1_create" },
           { title: "Delete the table", narration: "This deletes only demo-extra-sites and inventories again.", button: "Delete and scan", action: "demo1_delete" }
         ]
       },
@@ -203,28 +215,47 @@
       }
       if (info.sent) {
         mail.classList.add("sent");
-        mail.textContent = "Mail was sent to shruti.goyal@sjsu.edu. " + info.detail;
+        mail.textContent = info.detail;
       } else {
         mail.classList.add("failed");
-        mail.textContent = "Mail was not sent. " + info.detail;
+        mail.textContent = info.detail;
       }
       if (force === false) mail.hidden = true;
     }
-    function showIntro(stage, index, total, flowName) {
+    let currentPlan = null;
+    async function showIntro(stage, index, total, flowName) {
       mode = "intro";
       walk = null;
+      currentPlan = null;
       kicker.textContent = flowName + " · step " + (index + 1) + " of " + total;
       title.textContent = stage.title;
-      narration.textContent = stage.narration;
+      narration.textContent = "Loading the plan.";
       setFacts([]);
       setNote("");
       setMail(null);
       bar.hidden = true;
       closeBtn.hidden = false;
       nextBtn.hidden = false;
-      nextBtn.textContent = stage.button;
-      nextBtn.focus();
+      nextBtn.disabled = true;
+      nextBtn.textContent = "Verify and apply";
       show(true);
+      const response = await fetch("/api/jobs", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: stage.action }),
+      });
+      const payload = await response.json();
+      if (!response.ok || payload.applied !== false || !payload.plan) {
+        showError(payload.error || "The plan could not be loaded.");
+        return;
+      }
+      currentPlan = payload.plan;
+      title.textContent = payload.plan.title;
+      narration.textContent = payload.plan.lead;
+      setNote(payload.plan.items.join(" "));
+      nextBtn.textContent = payload.plan.button || "Verify and apply";
+      nextBtn.disabled = false;
+      nextBtn.focus();
     }
     function showProgress(message) {
       mode = "progress";
@@ -278,7 +309,10 @@
 
     nextBtn.addEventListener("click", async () => {
       if (mode === "intro") {
-        await runAction(flow.stages[stageIndex].action);
+        if (!currentPlan || nextBtn.disabled) return;
+        const action = flow.stages[stageIndex].action;
+        const body = currentPlan.requires_verify ? { action, verify: true } : { action, simulate: true };
+        await runAction(body);
         return;
       }
       if (mode !== "result") return;
@@ -296,11 +330,11 @@
       show(false);
     });
 
-    async function runAction(action) {
+    async function runAction(body) {
       showProgress("Starting.");
-      const response = await fetch("/api/jobs", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action }) });
+      const response = await fetch("/api/jobs", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
       const started = await response.json();
-      if (!response.ok) {
+      if (!response.ok || !started.id) {
         showError(started.error || "Could not start.");
         return;
       }
@@ -338,8 +372,32 @@
       const banner = document.getElementById("banner");
       const catalog = ready.sns_section ? "Confluence has the SNS demo section." : "Confluence SNS section: " + (ready.sns_message || "not ready");
       banner.textContent = catalog + " " + (ready.mail_note || "");
+      if (ready.region) document.getElementById("region-label").textContent = "Live demo · " + ready.region;
+      const footer = document.getElementById("footer");
+      const account = ready.account_id ? "Account " + ready.account_id + " · " : "";
+      footer.textContent = account + (ready.region || "") + " · recommend mode · repairs off · inventory can take a few minutes and this page stays on the step that is running.";
+      if (ready.confluence_page_link) {
+        const link = document.createElement("a");
+        link.href = ready.confluence_page_link;
+        link.textContent = "Confluence catalog";
+        banner.append(" ");
+        banner.append(link);
+      }
     }).catch(() => {
       document.getElementById("banner").textContent = "The page could not read demo status.";
+    });
+    fetch("/api/emails").then((response) => response.json()).then((payload) => {
+      const box = document.getElementById("mail-addresses");
+      if (box && Array.isArray(payload.addresses)) box.value = payload.addresses.join("\n");
+    }).catch(() => {});
+    document.getElementById("save-emails").addEventListener("click", async () => {
+      const response = await fetch("/api/emails", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ addresses: document.getElementById("mail-addresses").value }),
+      });
+      const payload = await response.json();
+      document.getElementById("email-status").textContent = payload.message || "";
     });
   </script>
 </body>

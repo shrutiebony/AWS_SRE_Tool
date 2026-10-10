@@ -22,28 +22,25 @@ def apply_catalog(assessment: HealthAssessment, rules: list[CatalogRule], record
         try:
             matched.append(rule.resolved(_placeholders(record)))
         except ConfluenceError as exc:
-            state = "unknown"
-            reasons.append(f"Catalog rule {rule.rule_id} has an unresolved placeholder: {exc}")
+            state = _worse(state, "degraded")
+            reasons.append(f"Could not read catalog rule {rule.rule_id}: {exc}")
     if catalog_only and not matched:
         return assessment
     for rule in matched:
         try:
             value, detail = _measure(rule, record, reader, start, end)
         except CloudError as exc:
-            state = "unknown"
+            state = _worse(state, "degraded")
             missing.append(rule.signal)
-            reasons.append(f"Catalog rule {rule.rule_id} v{rule.version} could not be evaluated: {exc}")
+            reasons.append(f"Could not read {rule.signal} for catalog rule {rule.rule_id} v{rule.version} ({exc}).")
             continue
         if value is None:
-            state = "unknown"
-            missing.append(rule.signal)
-            reasons.append(f"Catalog rule {rule.rule_id} v{rule.version} has no telemetry.")
             continue
         try:
             threshold = metric_math(rule.threshold_expression, {}) if rule.threshold_expression else rule.threshold
         except CloudError as exc:
-            state = "unknown"
-            reasons.append(f"Catalog rule {rule.rule_id} v{rule.version} has a threshold that cannot be calculated: {exc}")
+            state = _worse(state, "degraded")
+            reasons.append(f"Could not read the threshold for catalog rule {rule.rule_id} v{rule.version} ({exc}).")
             continue
         observed[rule.signal] = float(value)
         if _breached(value, rule.comparison, threshold):
@@ -51,8 +48,9 @@ def apply_catalog(assessment: HealthAssessment, rules: list[CatalogRule], record
             reasons.append(
                 f"Catalog rule {rule.rule_id} v{rule.version}: {rule.signal} is {value} {rule.comparison} {rule.threshold}. {detail}".strip()
             )
-    if state == "unknown" and assessment.state != "unknown":
-        reasons.append("A catalog rule could not be evaluated. Missing catalog telemetry is unknown, not healthy.")
+    if state not in {"healthy", "degraded", "unhealthy"}:
+        state = "degraded"
+        reasons.append(f"Could not read {', '.join(missing) or 'a catalog signal'}.")
     return HealthAssessment(record.resource_id, state, reasons, missing, observed, dict(assessment.context))
 
 
@@ -205,11 +203,11 @@ def _breached(value: float, comparison: str, threshold: float) -> bool:
 
 
 def _worse(current: str, new: str) -> str:
-    if current == "unknown" or new == "unknown":
-        return "unknown"
     rank = {"healthy": 0, "degraded": 1, "unhealthy": 2}
     if current not in rank:
-        return new
+        current = "degraded"
+    if new not in rank:
+        new = "degraded"
     return new if rank[new] > rank[current] else current
 
 

@@ -24,18 +24,22 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "src"))
 
 from demo_ui.report_parse import diagnoses_for, parse_lab, parse_report, resource_named  # noqa: E402
+from sre_agent.demo_mail import deliver_mail, load_recipients, save_recipients  # noqa: E402
+from sre_agent.demo_plans import allows_apply, plan_for  # noqa: E402
+from sre_agent.local_config import get, load_local_config, public_settings  # noqa: E402
+
+load_local_config()
 
 HOST = "127.0.0.1"
 PORT = 8765
-ACCOUNT = "414279120882"
-REGION = "us-east-2"
-SITES_URL = "https://af38fctvq2.execute-api.us-east-2.amazonaws.com/prod/sites"
+ACCOUNT = get("SRE_ACCOUNT_ID")
+REGION = get("SRE_REGION")
+SITES_URL = get("SRE_SITES_URL")
 EXPECTED_SITES = ["SITE-1001", "SITE-1008", "SITE-2044", "SITE-3102", "SITE-4410"]
 FUNCTION = "enterprise-sites-directory"
 DEMO_TABLE = "demo-extra-sites"
 DEMO_TOPIC = "demo-alerts"
-MAIL_TO = "shruti.goyal@sjsu.edu"
-PAGE_ID = "360481"
+PAGE_ID = get("CONFLUENCE_PAGE_ID")
 INVENTORY_TIMEOUT = 720
 AWS_TIMEOUT = 180
 
@@ -175,35 +179,15 @@ def save_state(updates: dict) -> None:
 
 
 def send_mail(subject: str, text: str) -> dict:
-    """Send through SES in us-east-2 via the AWS CLI. A failed call is reported, never treated as sent."""
-    payload = {
-        "FromEmailAddress": MAIL_TO,
-        "Destination": {"ToAddresses": [MAIL_TO]},
-        "Content": {
-            "Simple": {
-                "Subject": {"Data": subject, "Charset": "UTF-8"},
-                "Body": {"Text": {"Data": text, "Charset": "UTF-8"}},
-            }
-        },
-    }
-    path = Path(__file__).resolve().parent / "_mail_request.json"
-    path.write_text(json.dumps(payload), encoding="utf-8")
-    try:
-        code, out, err = run_command(
-            ["aws", "sesv2", "send-email", "--region", REGION, "--cli-input-json", "file://demo_ui/_mail_request.json"],
-            60,
-            lambda _message: None,
-            "Sending mail",
-        )
-    finally:
-        path.unlink(missing_ok=True)
-    if code != 0:
-        return {"sent": False, "detail": redact(err or out or "SES send failed")}
-    try:
-        message_id = json.loads(out or "{}").get("MessageId", "")
-    except json.JSONDecodeError:
-        message_id = ""
-    return {"sent": True, "detail": f"Sent to {MAIL_TO}. Message {message_id}."}
+    """Send through SES. An empty recipient list does not call AWS."""
+    if not load_recipients():
+        return {"sent": False, "detail": "Mail was not sent because no address is saved."}
+    load_cli_credentials()
+    for key, value in ENV.items():
+        if key.startswith("AWS_") and value:
+            os.environ[key] = value
+    detail = deliver_mail(subject, text)
+    return {"sent": detail.startswith("Mail was sent"), "detail": redact(detail)}
 
 
 def mail_body(what: str, resource: str, health: str, jira: str, extra: str = "") -> str:
@@ -221,34 +205,12 @@ def mail_body(what: str, resource: str, health: str, jira: str, extra: str = "")
 
 
 def ensure_ses_identity() -> str:
-    code, out, err = run_command(
-        ["aws", "sesv2", "get-email-identity", "--email-identity", MAIL_TO, "--region", REGION, "--output", "json"],
-        60,
-        lambda _message: None,
-        "Checking SES",
-    )
-    if code != 0 and "NotFoundException" in err:
-        code, _out, err = run_command(
-            ["aws", "sesv2", "create-email-identity", "--email-identity", MAIL_TO, "--region", REGION],
-            60,
-            lambda _message: None,
-            "Requesting SES verification",
-        )
-        if code != 0:
-            return redact(err or "Could not request SES verification")
+    if get("SES_FROM_ADDRESS"):
         return (
-            f"Amazon SES is in the sandbox. A verification message was sent to {MAIL_TO}. "
-            "Click that Amazon link before mail can be delivered."
+            "Amazon SES sends from the verified From address in the local config. "
+            "In the sandbox, each recipient must be verified too."
         )
-    if code != 0:
-        return redact(err or "Could not read the SES identity")
-    identity = json.loads(out or "{}")
-    if identity.get("VerifiedForSendingStatus"):
-        return f"{MAIL_TO} is verified in Amazon SES."
-    return (
-        f"Amazon SES is in the sandbox and {MAIL_TO} is not verified yet. "
-        "Click the Amazon verification link already sent to that address. Until then, each popup shows the send error."
-    )
+    return "SES from-address is empty in the local config, so mail cannot be sent."
 
 
 def _atlassian(kind: str):
@@ -832,18 +794,10 @@ def action_demo2_lab(progress) -> dict:
     if code != 0 and not parsed["checks"]:
         raise RuntimeError(err or "The lab failed to start")
     passed = code == 0 and parsed["passed"]
-    mail = send_mail(
-        "SRE agent: lab close verified" if passed else "SRE agent: lab close did not pass",
-        mail_body(
-            "The simulated repair was verified and the task moved to Done."
-            if passed
-            else "The lab did not verify the simulated close.",
-            "payments-dlq",
-            "recovered" if passed else "not recovered",
-            "simulated",
-            "This close is the local lab. The live KAN issue is not moved.",
-        ),
-    )
+    mail = {
+        "sent": False,
+        "detail": "This simulation does not send mail and does not change the live account.",
+    }
     by_name = {item["name"]: item for item in parsed["checks"]}
 
     def line_for(fragment: str) -> str:
@@ -1023,6 +977,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/ready":
             self._send(200, _ready, "application/json")
             return
+        if path == "/api/emails":
+            self._send(200, {"addresses": load_recipients()}, "application/json")
+            return
         if path.startswith("/api/jobs/"):
             job_id = path.rsplit("/", 1)[-1]
             with _jobs_lock:
@@ -1036,18 +993,32 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         path = self.path.split("?", 1)[0]
+        length = int(self.headers.get("Content-Length") or 0)
+        try:
+            body = json.loads(self.rfile.read(length).decode() or "{}") if length else {}
+        except json.JSONDecodeError:
+            body = {}
+        if not isinstance(body, dict):
+            body = {}
+        if path == "/api/emails":
+            saved = save_recipients(str(body.get("addresses") or ""))
+            self._send(200 if saved["ok"] else 400, saved, "application/json")
+            return
         if path != "/api/jobs":
             self._send(404, {"error": "Not found"}, "application/json")
             return
-        length = int(self.headers.get("Content-Length") or 0)
-        try:
-            body = json.loads(self.rfile.read(length).decode() or "{}")
-            started = start_job(str(body.get("action") or ""))
-        except KeyError:
-            self._send(400, {"error": "Unknown action"}, "application/json")
+        action = str(body.get("action") or "")
+        plan = plan_for(action, REGION)
+        if plan is None:
+            self._send(400, {"error": "Unknown action", "applied": False}, "application/json")
             return
+        if not allows_apply(action, body):
+            self._send(200, {"applied": False, "plan": plan}, "application/json")
+            return
+        try:
+            started = start_job(action)
         except RuntimeError as exc:
-            self._send(409, {"error": redact(str(exc))}, "application/json")
+            self._send(409, {"error": redact(str(exc)), "applied": False}, "application/json")
             return
         self._send(202, started, "application/json")
 
@@ -1060,6 +1031,11 @@ def prepare() -> None:
         _ready["sns_section"] = False
         _ready["sns_message"] = redact(str(exc))
     _ready["mail_note"] = ensure_ses_identity()
+    shown = public_settings()
+    _ready["account_id"] = shown["account_id"]
+    _ready["region"] = shown["region"]
+    _ready["confluence_page_link"] = shown["confluence_page_link"]
+    _ready["jira_browse_link"] = shown["jira_browse_link"]
     try:
         table = ((function_config().get("Environment") or {}).get("Variables") or {}).get("TABLE_NAME", "")
         _ready["table_name"] = table

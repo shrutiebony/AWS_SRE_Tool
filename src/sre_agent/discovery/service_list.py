@@ -8,7 +8,6 @@ resource types in that file are added. The original five collectors still run.
 from __future__ import annotations
 
 import json
-import os
 from dataclasses import dataclass
 
 
@@ -23,7 +22,12 @@ class WatchedService:
 
 
 def load_service_list(uri: str | None = None) -> list[WatchedService]:
-    location = os.environ.get("SRE_SERVICE_LIST_URI", "").strip() if uri is None else uri.strip()
+    if uri is None:
+        from sre_agent.local_config import get
+
+        location = get("SRE_SERVICE_LIST_URI")
+    else:
+        location = uri.strip()
     if not location:
         return []
     return parse_service_list(_read(location))
