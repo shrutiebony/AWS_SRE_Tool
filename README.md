@@ -77,7 +77,3 @@ Restore the table name with another apply of working:
 ```powershell
 terraform -chdir=monitor-labs/working apply
 ```
-
-## Optional deployed checker
-
-`terraform/` can deploy the checker into AWS. It is separate from the sample workload and is not required to run the local page.
