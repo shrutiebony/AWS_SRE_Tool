@@ -14,7 +14,6 @@ Copy-Item config.example.json config.local.json
 $env:PYTHONPATH = "src"
 ```
 
-Settings live in `config.local.json`. That file is gitignored. `config.example.json` is the empty template. Copy the example and fill the local file. A variable already set in the environment wins over the file. Do not put tokens in this README.
 
 Fill `aws_account_id`, `aws_region`, `confluence_base_url`, `jira_base_url`, `confluence_page_id`, `jira_project`, and `aws_console_url`. Secrets stay in that local file or in AWS Secrets Manager (`confluence_secret_arn` and `jira_secret_arn`), not in git.
 
@@ -46,7 +45,7 @@ flowchart LR
 
 ### Health checker
 
-Workloads are grouped by type, with a count on each group. Open a type to see name, type, health, problem code, and source. Details shows the account, region, inventory time, and catalog. The console link comes only from `aws_console_url`.
+Workloads are grouped by type, with a count on each group. Open a type to see name, type, health, problem code, and source. Details shows the account, region, inventory time, and catalog.
 
 ### Jira
 
@@ -62,7 +61,7 @@ Mail is at the bottom of the health checker. Saved addresses are in a dropdown. 
 
 ## Sample workload
 
-`monitor-labs/working` creates one DynamoDB table, one Lambda that reads it, and one API Gateway that calls that Lambda. Names use the prefix `sre-dir-lab` in `us-east-2`. Apply working first.
+`monitor-labs/working` creates one DynamoDB table, one Lambda that reads it, and one API Gateway that calls that Lambda.
 
 `monitor-labs/break` points that Lambda at a missing table, calls the API, and runs inventory so a Jira ticket with Take this action is opened. Applying working again restores the table name.
 
