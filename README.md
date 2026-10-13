@@ -15,7 +15,7 @@ $env:PYTHONPATH = "src"
 ```
 
 
-Fill `aws_account_id`, `aws_region`, `confluence_base_url`, `jira_base_url`, `confluence_page_id`, `jira_project`, and `aws_console_url`. Secrets stay in that local file or in AWS Secrets Manager (`confluence_secret_arn` and `jira_secret_arn`), not in git.
+Populate config as per rwquirement. Secrets stay in that local file or in AWS Secrets Manager (`confluence_secret_arn` and `jira_secret_arn`), not in git.
 
 Start the page, then open http://127.0.0.1:8765/ :
 
