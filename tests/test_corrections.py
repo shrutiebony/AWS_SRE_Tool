@@ -77,7 +77,10 @@ def test_a_second_cycle_reuses_the_open_incident_and_jira_issue():
     assert {item.incident_id for item in second.diagnoses} <= first_ids
     assert len(agent.registry.incidents()) == len(first_ids)
     assert len(jira.issues) == issue_count
-    assert issue_count == len({item.dedup_key for item in first.diagnoses})
+    from sre_agent.integrations.jira import issue_is_actionable
+
+    assert issue_count == len({item.dedup_key for item in first.diagnoses if issue_is_actionable(item)})
+    assert issue_count >= 1
 
 
 def test_standard_alarm_dimensions_map_to_the_queue():
@@ -314,6 +317,7 @@ def test_jira_resolves_only_after_verified_recovery():
     publish_recovery(world)
     agent.verify(actions)
     issue = next(item for item in jira.issues.values() if item.dedup_key.endswith("sqs.dlq_transient"))
+    assert issue.dedup_key == f"{ACCOUNT}|{REGION}|sqs:queue|sqs.dlq_transient"
     assert issue.status == "Done"
     assert jira.transitioned == [issue.key]
     assert any("verified recovery" in comment for comment in issue.comments)

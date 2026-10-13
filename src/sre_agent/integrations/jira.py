@@ -4,11 +4,31 @@ from __future__ import annotations
 
 import json
 import re
+import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 
 from sre_agent.aws.errors import CloudError
-from sre_agent.diagnosis.rules import plain_catalog_issue, plain_missing_issue, problem_identity_text
+from sre_agent.diagnosis.rules import (
+    _breach_pairs,
+    _placeholder_names,
+    is_checker_machinery,
+    plain_catalog_issue,
+    plain_missing_issue,
+    problem_identity_text,
+)
+
+_NOT_A_TICKET = frozenset(
+    {
+        "healthy",
+        "signal.missing",
+        "telemetry.missing",
+        "monitoring.unsupported",
+        "presence.uncertain",
+        "registry.missing",
+        "cloudwatch.alarm",
+    }
+)
 
 _UNKNOWN_TITLES = {"unknown", "health is unknown", "health is unknown."}
 
@@ -17,12 +37,109 @@ class JiraError(CloudError):
     pass
 
 
-def issue_dedup_key(diagnosis) -> str:
-    """One open ticket per distinct problem. The key does not include the resource."""
-    return "problem|" + problem_identity(diagnosis)
+def false_alarm_text(text: str) -> bool:
+    """Unevaluable rules, missing logs, placeholders, and quiet telemetry are not tickets."""
+    lowered = (text or "").strip().lower()
+    if not lowered:
+        return True
+    markers = (
+        "cannot be evaluated",
+        "was not evaluated",
+        "has no value",
+        "unresolved placeholder",
+        "resourcenotfoundexception",
+        "log group does not exist",
+        "no fault is currently observed",
+        "required telemetry is missing",
+        "not confirmed present",
+        "signal.missing",
+        "telemetry.missing",
+    )
+    if any(marker in lowered for marker in markers):
+        return True
+    if "${" in text:
+        return not bool(_breach_pairs(text))
+    return False
+
+
+def issue_is_actionable(diagnosis) -> bool:
+    """A Jira write is for a breached symptom or a confirmed fault.
+
+    Closing still runs after a verified recovery. A placeholder, a quiet series,
+    a missing log group, a healthy resource, or the checker's own queue does not
+    open or update a ticket.
+    """
+    if is_checker_machinery(str(getattr(diagnosis, "resource_id", "") or "")):
+        return False
+    if getattr(diagnosis, "status", "") == "recovered":
+        return True
+    code = str(getattr(diagnosis, "problem_code", "") or "")
+    if code in _NOT_A_TICKET or code.startswith("catalog.placeholder"):
+        return False
+    if str(getattr(diagnosis, "health", "") or "") == "healthy":
+        return False
+    if false_alarm_text(getattr(diagnosis, "observed_problem", "") or ""):
+        return False
+    if false_alarm_text(_issue_text(diagnosis)):
+        return False
+    blob = _evidence_blob(diagnosis)
+    lowered = blob.lower()
+    breached = bool(_breach_pairs(blob))
+    real_breach = any("${" not in signal and not signal.startswith("$") for _rule, signal in _breach_pairs(blob))
+    placeholder_problem = (
+        bool(_placeholder_names(blob))
+        or "unresolved placeholder" in lowered
+        or "has no value" in lowered
+        or "was not evaluated" in lowered
+        or "cannot be evaluated" in lowered
+        or "resourcenotfoundexception" in lowered
+    )
+    if placeholder_problem and not real_breach:
+        return False
+    if "could not read catalog rule" in lowered and not real_breach:
+        return False
+    if code == "catalog.symptom" and not real_breach:
+        return False
+    if "required telemetry is missing" in lowered and not real_breach:
+        return False
+    if not breached and code == "catalog.symptom":
+        return False
+    if str(getattr(diagnosis, "health", "") or "") not in {"degraded", "unhealthy"}:
+        return False
+    return _card_can_take_action(diagnosis)
+
+
+def issue_dedup_key(diagnosis, record=None) -> str:
+    """One open ticket per account, region, resource type, and problem code."""
+    account = str(getattr(record, "account_id", "") or "")
+    region = str(getattr(record, "region", "") or "")
+    resource_type = str(getattr(record, "resource_type", "") or "")
+    if not (account and region and resource_type):
+        parsed_account, parsed_region, parsed_type = _identity_from_resource(getattr(diagnosis, "resource_id", "") or "")
+        account = account or parsed_account
+        region = region or parsed_region
+        resource_type = resource_type or parsed_type
+    code = str(getattr(diagnosis, "problem_code", "") or "unspecified")
+    return f"{account}|{region}|{resource_type}|{code}"
+
+
+def _identity_from_resource(resource_id: str) -> tuple[str, str, str]:
+    from sre_agent.aws.names import SERVICE_TYPES, parse_arn
+
+    try:
+        parsed = parse_arn(resource_id)
+    except ValueError:
+        return "", "", ""
+    return parsed.get("account") or "", parsed.get("region") or "", SERVICE_TYPES.get(parsed.get("service") or "", "")
 
 
 def problem_identity(diagnosis) -> str:
+    action = getattr(diagnosis, "proposed_action", None)
+    runbook = str(getattr(action, "runbook_id", "") or "").strip()
+    # A confirmed repair stays its own ticket. A shared catalog breach must not
+    # pull that repair onto an unrelated queue's issue.
+    if runbook and str(getattr(diagnosis, "problem_code", "") or "").strip():
+        return str(diagnosis.problem_code)
     blob = _evidence_blob(diagnosis)
     missing = []
     for item in diagnosis.evidence:
@@ -44,13 +161,99 @@ def star_sections(diagnosis) -> tuple[str, str, str]:
 
 def star_plain(diagnosis) -> str:
     issue, where, proposed = star_sections(diagnosis)
-    return f"* Issue\n{issue}\n\n* Where\n{where}\n\n* Proposed solution\n{proposed}"
+    return f"* Issue\n{issue}\n\n* Where seen\n{where}\n\n* Proposed solution\n{proposed}"
+
+
+def _diagnosis_resource(resource_id: str) -> tuple[str, str]:
+    if ":function:" in resource_id:
+        return resource_id.split(":function:", 1)[1], "lambda:function"
+    if resource_id.startswith("arn:aws:sqs:"):
+        return resource_id.rsplit(":", 1)[-1], "sqs:queue"
+    if ":table/" in resource_id:
+        return resource_id.rsplit("/", 1)[-1], "dynamodb:table"
+    if "/restapis/" in resource_id:
+        return "", "apigateway:restapi"
+    return "", ""
+
+
+def _card_rows(name: str, resource_id: str, resource_type: str) -> list[dict]:
+    """Rows the page can match. A directory function also sees the API and table that share its name."""
+    rows = []
+    if name or resource_id:
+        rows.append({"name": name, "resource_id": resource_id, "resource_type": resource_type})
+    if resource_type == "lambda:function" and name in {"sre-dir-lab", "enterprise-sites-directory"}:
+        rows.append(
+            {
+                "name": name,
+                "resource_id": "arn:aws:apigateway:us-east-2::/restapis/shared-name",
+                "resource_type": "apigateway:restapi",
+            }
+        )
+        rows.append(
+            {
+                "name": name,
+                "resource_id": f"arn:aws:dynamodb:us-east-2:000000000000:table/{name}",
+                "resource_type": "dynamodb:table",
+            }
+        )
+    return rows
+
+
+def _card_can_take_action(diagnosis) -> bool:
+    """Same decision the Jira card uses before it draws Take this action.
+
+    The card is the saved Issue, Where seen, and Proposed solution text after the
+    page links a resource. An API or table that shares the function name must not
+    hide a directory restore, and it must not become a ticket on its own.
+    """
+    from sre_agent.demo_plans import resolved_proposal
+    from sre_agent.demo_ui import _decision_for, _linked_issue
+
+    issue, where, proposed = star_sections(diagnosis)
+    resource_id = str(getattr(diagnosis, "resource_id", "") or "")
+    name, resource_type = _diagnosis_resource(resource_id)
+    view = {
+        "summary": issue,
+        "situation": issue,
+        "where_seen": where,
+        "task": where,
+        "proposed": proposed,
+        "resource_id": resource_id,
+        "resource_name": name,
+        "resource_type": resource_type,
+    }
+    linked = _linked_issue(view, _card_rows(name, resource_id, resource_type))
+    linked["proposed"] = resolved_proposal(linked, proposed)
+    return bool(_decision_for(linked).get("run"))
 
 
 def proposed_solution(diagnosis) -> str:
-    """A concrete correction. A runbook is the solution when one exists."""
+    """A concrete correction the tool can run. The placeholder sentence is never used."""
+    resource_id = str(getattr(diagnosis, "resource_id", "") or "")
+    if is_checker_machinery(resource_id):
+        return ""
+    from sre_agent.demo_plans import concrete_correction
+
+    name = resource_id.split(":function:", 1)[1] if ":function:" in resource_id else ""
+    seen = getattr(diagnosis, "where_seen", None) or []
+    concrete = concrete_correction(
+        {
+            "resource_id": resource_id,
+            "resource_name": name,
+            "resource_type": "lambda:function" if name else "",
+            "where_seen": "\n".join(str(item) for item in seen),
+            "situation": diagnosis.observed_problem or "",
+            "summary": "",
+        }
+    )
+    if concrete:
+        return concrete
+    if "enterprise-sites-directory" in resource_id:
+        return "Set Lambda function enterprise-sites-directory TABLE_NAME to enterprise-sites."
     action = diagnosis.proposed_action
     if action is not None and str(action.runbook_id or "").strip():
+        if is_checker_machinery(str(action.target_resource_id or ""), resource_id):
+            return ""
         rationale = str(action.rationale or "").strip()
         lead = f"Run {action.runbook_id}."
         if rationale:
@@ -62,7 +265,19 @@ def proposed_solution(diagnosis) -> str:
         return " ".join(steps)
     if diagnosis.problem_code == "monitoring.unsupported":
         return "Register a monitoring pack for this resource type, or add a Confluence symptom that names the metric, statistic, and threshold to check."
-    return "Name the configuration or metric change that corrects this problem. Nothing runs until you verify that change."
+    from sre_agent.demo_plans import concrete_correction
+
+    seen = getattr(diagnosis, "where_seen", None) or []
+    concrete = concrete_correction(
+        {
+            "resource_id": resource_id,
+            "resource_name": "",
+            "where_seen": "\n".join(str(item) for item in seen),
+            "situation": diagnosis.observed_problem or "",
+            "summary": "",
+        }
+    )
+    return concrete
 
 
 def _correction_steps(diagnosis, blob: str) -> list[str]:
@@ -285,6 +500,10 @@ class FakeJira:
         self.last_created = False
 
     def sync(self, diagnosis) -> str:
+        if not issue_is_actionable(diagnosis):
+            self.last_created = False
+            self._dismiss_false(diagnosis)
+            return diagnosis.jira_issue_key or ""
         if self.failures:
             self.failures -= 1
             raise JiraError("Jira is unavailable")
@@ -331,12 +550,59 @@ class FakeJira:
             raise JiraError(issue_key)
         self.comments.setdefault(issue_key, []).append({"author_account_id": author_account_id, "body": body})
 
+    def add_note(self, key: str, body: str) -> None:
+        """Record a verified correction. This does not transition the issue."""
+        if key not in self.issues:
+            raise JiraError(key)
+        self.comments.setdefault(key, []).append({"author_account_id": "sre-agent", "body": body})
+        self.issues[key].comments.append(body)
+
     def close(self, key: str) -> None:
         issue = self.issues.get(key)
         if issue is None:
             raise JiraError(key)
         self._transition(issue)
         issue.comments.append("Closed after you verified the proposed action and it was performed.")
+
+    def list_open(self) -> list[dict]:
+        """Open issues, in the same shape the live client returns."""
+        found = []
+        for issue in self.issues.values():
+            if issue.status == self.transition_name:
+                continue
+            found.append(
+                {
+                    "key": issue.key,
+                    "fields": {
+                        "summary": issue.summary,
+                        "status": {"name": issue.status},
+                        "description": issue.description,
+                    },
+                }
+            )
+        found.sort(key=lambda item: str(item.get("key") or ""))
+        return found
+
+    def dismiss(self, key: str) -> None:
+        """Close a ticket that was never a fault. This is not a verified repair."""
+        issue = self.issues.get(key)
+        if issue is None or issue.status == self.transition_name:
+            return
+        self._transition(issue)
+        issue.comments.append("Closed because this is not a current fault.")
+
+    def _dismiss_false(self, diagnosis) -> None:
+        text = _issue_text(diagnosis)
+        if not false_alarm_text(text):
+            return
+        want = _normal_issue(text)
+        for issue in list(self.issues.values()):
+            if issue.status == self.transition_name:
+                continue
+            parsed = parse_star_description(issue.description)
+            candidate = (parsed or {}).get("issue") or issue.summary
+            if _normal_issue(candidate) == want:
+                self.dismiss(issue.key)
 
     def _transition(self, issue: JiraIssue) -> None:
         issue.status = self.transition_name
@@ -354,6 +620,10 @@ class HttpJira:
         self.last_created = False
 
     def sync(self, diagnosis) -> str:
+        if not issue_is_actionable(diagnosis):
+            self.last_created = False
+            self._dismiss_false(diagnosis)
+            return diagnosis.jira_issue_key or ""
         key = self._search_open(diagnosis)
         if not key:
             key = self._if_still_open(diagnosis.jira_issue_key)
@@ -407,6 +677,32 @@ class HttpJira:
             {"body": _text("Closed after you verified the proposed action and it was performed.")},
         )
 
+    def add_note(self, key: str, body: str) -> None:
+        """Record a verified correction. This does not transition the issue."""
+        self._request("POST", f"/rest/api/3/issue/{key}/comment", {"body": _text(body)})
+
+    def dismiss(self, key: str) -> None:
+        """Close a ticket that was never a fault. This is not a verified repair."""
+        self._transition(key)
+        self._request(
+            "POST",
+            f"/rest/api/3/issue/{key}/comment",
+            {
+                "body": _text(
+                    "Closed because this is not a current fault. "
+                    "An unevaluable catalog rule, a missing log group, a placeholder, or missing telemetry does not keep a ticket open."
+                )
+            },
+        )
+
+    def _dismiss_false(self, diagnosis) -> None:
+        text = _issue_text(diagnosis)
+        if not false_alarm_text(text):
+            return
+        key = self._search_same_issue(text)
+        if key:
+            self.dismiss(key)
+
     def list_open(self) -> list[dict]:
         """Open issues in the configured project. Nothing is added that Jira did not return."""
         query = f'project = "{self.project}" AND statusCategory != Done'
@@ -440,9 +736,11 @@ class HttpJira:
     def _transition(self, key: str) -> None:
         payload = self._request("GET", f"/rest/api/3/issue/{key}/transitions")
         transition_id = ""
+        wanted = self.transition_name.casefold()
         for item in payload.get("transitions") or []:
-            destination = ((item.get("to") or {}).get("name") or "")
-            if destination == self.transition_name or item.get("name") == self.transition_name:
+            destination = str(((item.get("to") or {}).get("name") or ""))
+            name = str(item.get("name") or "")
+            if destination.casefold() == wanted or name.casefold() == wanted:
                 transition_id = str(item.get("id") or "")
                 break
         if not transition_id:
@@ -508,8 +806,11 @@ class HttpJira:
         request.add_header("Accept", "application/json")
         request.add_header("Content-Type", "application/json")
         try:
-            with urllib.request.urlopen(request, timeout=10) as response:
+            with urllib.request.urlopen(request, timeout=20) as response:
                 raw = response.read().decode()
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode(errors="replace")[:400]
+            raise JiraError(f"HTTP {exc.code}: {detail}") from None
         except Exception as exc:
             raise JiraError(str(exc)) from exc
         return json.loads(raw) if raw else {}
@@ -531,7 +832,7 @@ def _ticket_summary(diagnosis) -> str:
 def _star_doc(diagnosis) -> dict:
     issue, where, proposed = star_sections(diagnosis)
     content = []
-    for title, body in (("Issue", issue), ("Where", where), ("Proposed solution", proposed)):
+    for title, body in (("Issue", issue), ("Where seen", where), ("Proposed solution", proposed)):
         content.append({"type": "heading", "attrs": {"level": 3}, "content": [{"type": "text", "text": title}]})
         for line in (body or " ").split("\n"):
             content.append({"type": "paragraph", "content": [{"type": "text", "text": line[:2000]}]})

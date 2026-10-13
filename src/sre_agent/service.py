@@ -117,6 +117,76 @@ class OperationsAgent:
             diagnoses=diagnoses,
         )
 
+    def publish_health_board(self, report: CycleReport) -> None:
+        """Open one ticket for an actionable fault. Close it when that resource is healthy.
+
+        This uses the same Jira sync as inventory. It does not repair or narrate.
+        """
+        if self.jira is None:
+            return
+        from sre_agent.integrations.jira import issue_is_actionable
+
+        for diagnosis in report.diagnoses:
+            if _diagnosis_is_healthy(diagnosis):
+                continue
+            self._reuse_incident(diagnosis)
+            if issue_is_actionable(diagnosis):
+                self._sync_jira(diagnosis)
+        self._close_healthy_tickets(report.diagnoses)
+
+    def _close_healthy_tickets(self, diagnoses: list[Diagnosis]) -> None:
+        """Resolve an open ticket when every resource it names is healthy on this read."""
+        if self.jira is None:
+            return
+        by_id = {item.resource_id: item for item in diagnoses if item.resource_id}
+        healthy = {resource_id for resource_id, item in by_id.items() if _diagnosis_is_healthy(item)}
+        if not healthy:
+            return
+        try:
+            open_issues = _open_issue_bodies(self.jira)
+        except Exception as exc:
+            self._note_jira_failure(exc)
+            return
+        for key, description in open_issues:
+            linked = _ticket_resource_ids(self, description, by_id)
+            if not linked or any(resource_id not in healthy for resource_id in linked):
+                continue
+            self._resolve_issue(key, by_id[linked[0]])
+
+    def _resolve_issue(self, key: str, diagnosis: Diagnosis) -> None:
+        """Close this open issue through Jira sync because the resource is healthy."""
+        from sre_agent.integrations.jira import issue_dedup_key
+
+        record = self.registry.get_by_resource_id(diagnosis.resource_id)
+        closing = Diagnosis(
+            incident_id=diagnosis.incident_id,
+            resource_id=diagnosis.resource_id,
+            observed_problem=diagnosis.observed_problem or "No fault is currently observed.",
+            problem_code=diagnosis.problem_code or "healthy",
+            health="healthy",
+            status="recovered",
+        )
+        closing.dedup_key = issue_dedup_key(closing, record) if record is not None else diagnosis.resource_id
+        closing.jira_issue_key = key
+        closing.where_seen = []
+        closing.where_authoritative = True
+        try:
+            self.jira.sync(closing)
+        except Exception as exc:
+            self._note_jira_failure(exc)
+
+    def _note_jira_failure(self, exc: BaseException) -> None:
+        self.registry.add_scan(
+            ScanAccess(
+                account_id="*",
+                region="*",
+                collector="jira",
+                status="error",
+                scanned_at=self.clock.iso(),
+                message=f"Jira synchronization failed. {exc}",
+            )
+        )
+
     def inventory(self):
         self._catalog_loaded = False
         listed = self._service_list()
@@ -144,9 +214,18 @@ class OperationsAgent:
                 group = [item for item in records if id(_reader_for(self.scope, item.account_id)) == key]
                 prepared[key] = self._prepare_reader(reader, group, start, end)
         assessments = []
-        for record in records:
-            reader = prepared[id(_reader_for(self.scope, record.account_id))]
-            assessments.append(self._apply_sample(record, start, end, False, reader=reader))
+        self._catalog_skip_lines = []
+        self._batch_catalog_skips = True
+        self._alarm_cache = {}
+        try:
+            for record in records:
+                reader = prepared[id(_reader_for(self.scope, record.account_id))]
+                assessments.append(self._apply_sample(record, start, end, False, reader=reader))
+            self._flush_catalog_skips()
+            self._stamp_unsampled_alarms(assessments)
+        finally:
+            self._batch_catalog_skips = False
+            self._alarm_cache = None
         return assessments
 
     def diagnose_open(self) -> list[Diagnosis]:
@@ -459,7 +538,7 @@ class OperationsAgent:
             return
         from sre_agent.integrations.jira import issue_dedup_key
 
-        diagnosis.dedup_key = issue_dedup_key(diagnosis)
+        diagnosis.dedup_key = issue_dedup_key(diagnosis, record)
         open_states = {"open", "recommended", "executing", "escalated", "unresolved"}
         for existing in self.registry.incidents():
             same_resource = existing.resource_id == diagnosis.resource_id and existing.problem_code == diagnosis.problem_code
@@ -510,7 +589,9 @@ class OperationsAgent:
             try:
                 diagnosis.jira_issue_key = self.jira.sync(diagnosis)
                 if getattr(self.jira, "last_created", False):
-                    _mail_new_ticket(diagnosis)
+                    note = _mail_new_ticket(diagnosis)
+                    previous = getattr(self, "last_mail_note", "")
+                    self.last_mail_note = note if not previous else f"{previous} {note}"
                 return
             except Exception as exc:
                 last = str(exc)
@@ -521,7 +602,7 @@ class OperationsAgent:
                 collector="jira",
                 status="error",
                 scanned_at=self.clock.iso(),
-                message=f"Jira synchronization failed after retries. {last}",
+                message="Jira synchronization failed after retries. " + _jira_failure_sentence(last),
             )
         )
 
@@ -701,17 +782,183 @@ class OperationsAgent:
         assessment = sample(record, reader, start, end, start_exclusive)
         if self.catalog_status != "failed" and self.catalog_rules and reader is not None:
             assessment = apply_catalog(assessment, self.catalog_rules, record, reader, start, end)
+        from sre_agent.monitoring.packs import release_restored_api, restored_directory_health
+
+        assessment = restored_directory_health(record, assessment)
+        assessment = release_restored_api(record, assessment, self.registry.list_resources())
+        stamped = self._stamp_alarm(record, assessment)
+        if stamped is not None:
+            assessment = stamped
+        self._remember_health(record, assessment)
+        self._collect_catalog_skips(assessment)
+        if not getattr(self, "_batch_catalog_skips", False):
+            self._flush_catalog_skips()
+        return assessment
+
+    def _remember_health(self, record: ResourceRecord, assessment: HealthAssessment) -> None:
         record.health = assessment.state
         record.health_reasons = list(assessment.reasons)
         record.missing_signals = list(assessment.missing_signals)
         record.observed_signals = {key: float(value) for key, value in assessment.observed_signals.items()}
         record.signal_context = dict(assessment.context)
         self.registry.save(record)
-        return assessment
+
+    def _stamp_alarm(self, record: ResourceRecord, assessment: HealthAssessment | None) -> HealthAssessment | None:
+        """Mark a resource unhealthy while a matching CloudWatch alarm is in ALARM.
+
+        A directory function is unhealthy from the alarm alone. Other resources
+        still need a live fault. OK alarms leave health unchanged.
+        """
+        from sre_agent.monitoring.alarms import (
+            alarm_requires_action,
+            apply_alarm_health,
+            breaching_names,
+            has_current_fault,
+            match_alarms,
+        )
+
+        alarms = self._alarms_for(record)
+        if not alarms:
+            return assessment
+        names = breaching_names(match_alarms([record], alarms).get(record.resource_id, []))
+        if not names:
+            return assessment
+        if not has_current_fault(record, assessment) and not alarm_requires_action(record):
+            return assessment
+        return apply_alarm_health(assessment, record.resource_id, names)
+
+    def _alarms_for(self, record: ResourceRecord) -> list[dict]:
+        from sre_agent.monitoring.alarms import read_metric_alarms
+
+        reader = _reader_for(self.scope, record.account_id)
+        key = (record.account_id, record.region)
+        cache = getattr(self, "_alarm_cache", None)
+        if isinstance(cache, dict) and key in cache:
+            return cache[key]
+        loaded = read_metric_alarms(reader, record.region)
+        if loaded is None:
+            self._note_alarm_read_failed(record.region)
+            loaded = []
+        if isinstance(cache, dict):
+            cache[key] = loaded
+        return loaded
+
+    def _stamp_unsampled_alarms(self, assessments: list[HealthAssessment]) -> None:
+        """A resource that was not sampled still takes an alarm when it already has a live fault."""
+        seen = {item.resource_id for item in assessments}
+        for record in self.registry.list_resources():
+            if record.presence != "present" or record.resource_id in seen:
+                continue
+            updated = self._stamp_alarm(record, None)
+            if updated is None:
+                continue
+            self._remember_health(record, updated)
+            assessments.append(updated)
+
+    def _note_alarm_read_failed(self, region: str) -> None:
+        seen = getattr(self, "_alarm_read_failed", None)
+        if seen is None:
+            seen = set()
+            self._alarm_read_failed = seen
+        if region in seen:
+            return
+        seen.add(region)
+        self.registry.add_scan(
+            ScanAccess(
+                account_id="*",
+                region=region,
+                collector="cloudwatch-alarms",
+                status="error",
+                scanned_at=self.clock.iso(),
+                message=f"CloudWatch alarms could not be read in {region}.",
+            )
+        )
+
+    def _collect_catalog_skips(self, assessment: HealthAssessment) -> None:
+        text = str((assessment.context or {}).get("catalog_skips") or "")
+        lines = getattr(self, "_catalog_skip_lines", None)
+        if lines is None:
+            lines = []
+            self._catalog_skip_lines = lines
+        for part in text.split("; "):
+            part = part.strip()
+            if part and part not in lines:
+                lines.append(part)
+
+    def _flush_catalog_skips(self) -> None:
+        lines = list(getattr(self, "_catalog_skip_lines", None) or [])
+        self._catalog_skip_lines = []
+        if not lines:
+            return
+        self.registry.add_scan(
+            ScanAccess(
+                account_id="*",
+                region="*",
+                collector="catalog",
+                status="note",
+                scanned_at=self.clock.iso(),
+                resource_count=len(lines),
+                message=" ".join(lines),
+            )
+        )
 
     def _lookback(self):
         end = self.clock.now()
         return end - timedelta(seconds=self.config.metric_lookback_seconds), end
+
+
+def _jira_failure_sentence(detail: str) -> str:
+    """A short reason the page can show. The Atlassian token is not included."""
+    text = detail.lower()
+    if "401" in text or "must be authenticated" in text or "doesn't exist or you don't have permission" in text:
+        return "Jira rejected the new ticket because the Atlassian login is not accepted."
+    return detail[:300]
+
+
+def _diagnosis_is_healthy(diagnosis: Diagnosis) -> bool:
+    return diagnosis.health == "healthy" or diagnosis.problem_code == "healthy"
+
+
+def _open_issue_bodies(jira) -> list[tuple[str, object]]:
+    """Key and description for issues that are still open."""
+    if hasattr(jira, "list_open"):
+        rows = []
+        for item in jira.list_open() or []:
+            if not isinstance(item, dict):
+                continue
+            key = str(item.get("key") or "")
+            fields = item.get("fields") or {}
+            if key:
+                rows.append((key, fields.get("description")))
+        return rows
+    issues = getattr(jira, "issues", None)
+    if not isinstance(issues, dict):
+        return []
+    done = getattr(jira, "transition_name", "Done")
+    return [(issue.key, issue.description) for issue in issues.values() if issue.status != done]
+
+
+def _ticket_resource_ids(agent, description, by_id: dict[str, Diagnosis]) -> list[str]:
+    """Resources this ticket names that were on the read."""
+    from sre_agent.demo_plans import directory_restore_function
+    from sre_agent.integrations.jira import parse_star_description
+
+    parsed = parse_star_description(description) or {}
+    blob = "\n".join(str(parsed.get(name) or "") for name in ("issue", "where_seen", "proposed"))
+    if not blob.strip() and isinstance(description, str):
+        blob = description
+    found = [resource_id for resource_id in by_id if resource_id and resource_id in blob]
+    if found:
+        return found
+    function = directory_restore_function(str(parsed.get("proposed") or ""))
+    if not function:
+        return []
+    matched = []
+    for resource_id in by_id:
+        record = agent.registry.get_by_resource_id(resource_id)
+        if record is not None and record.name == function and record.resource_type == "lambda:function":
+            matched.append(resource_id)
+    return matched
 
 
 def _where_line(record: ResourceRecord) -> str:
@@ -731,11 +978,11 @@ def _simulator_mutator(scope: Scope, account_id: str):
     return None
 
 
-def _mail_new_ticket(diagnosis: Diagnosis) -> None:
-    """A failed send does not undo the Jira ticket."""
+def _mail_new_ticket(diagnosis: Diagnosis) -> str:
+    """A failed send does not undo the Jira ticket. The sentence is what the page shows."""
     try:
         from sre_agent.demo_mail import ticket_mail
 
-        ticket_mail(diagnosis, diagnosis.jira_issue_key)
+        return ticket_mail(diagnosis, diagnosis.jira_issue_key)
     except Exception:
-        return
+        return "Mail was not sent because the send failed before SES accepted it."

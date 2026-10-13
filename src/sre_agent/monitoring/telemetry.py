@@ -90,10 +90,27 @@ def sample(
         context["dlq_growth"] = "unknown" if growth is None else str(growth)
     if record.resource_type == "lambda:function":
         context.update(_lambda_freshness(raw, start, end, start_exclusive))
+    _fill_quiet_series(record, signals)
+    return assess(record, signals, context)
+
+
+def _fill_quiet_series(record: ResourceRecord, signals: dict[str, float | None]) -> None:
+    """A successful read with no points is zero. CloudWatch does not publish a quiet series."""
     for name in _ZERO_WHEN_ABSENT.get(record.resource_type, ()):
         if name in signals and signals[name] is None:
             signals[name] = 0.0
-    return assess(record, signals, context)
+    if record.resource_type != "sqs:queue":
+        return
+    visible_name = "ApproximateNumberOfMessagesVisible"
+    age_name = "ApproximateAgeOfOldestMessage"
+    visible = signals.get(visible_name)
+    if age_name in signals and signals[age_name] is None and visible in {None, 0, 0.0}:
+        signals[age_name] = 0.0
+        if visible is None and visible_name in signals:
+            signals[visible_name] = 0.0
+    dlq_name = "dlq.ApproximateNumberOfMessagesVisible"
+    if dlq_name in signals and signals[dlq_name] is None:
+        signals[dlq_name] = 0.0
 
 
 def _load_metrics(record: ResourceRecord, reader, names: list[str], start: datetime, end: datetime) -> dict:

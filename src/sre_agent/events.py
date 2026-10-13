@@ -10,6 +10,7 @@ _DIMENSION_KEYS = {
     "AWS/EC2": "InstanceId",
     "AWS/DynamoDB": "TableName",
     "AWS/ApiGateway": "ApiName",
+    "AWS/SNS": "TopicName",
 }
 _TYPE_BY_NAMESPACE = {
     "AWS/SQS": "sqs:queue",
@@ -17,6 +18,7 @@ _TYPE_BY_NAMESPACE = {
     "AWS/EC2": "ec2:instance",
     "AWS/DynamoDB": "dynamodb:table",
     "AWS/ApiGateway": "apigateway:restapi",
+    "AWS/SNS": "sns:topic",
 }
 
 

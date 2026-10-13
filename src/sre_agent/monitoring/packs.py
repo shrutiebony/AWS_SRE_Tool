@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from sre_agent.diagnosis.rules import directory_table_matches, wrong_directory_table
 from sre_agent.models import HealthAssessment, ResourceRecord
 
 LAMBDA_REQUIRED = ["Errors", "Invocations", "Throttles", "Duration"]
@@ -119,10 +120,81 @@ def _assess_lambda(record, observed, missing, context) -> HealthAssessment:
         reasons.append(f"Sparse metrics omit {', '.join(sparse)}. The consumer is not marked healthy.")
         if ready == "yes":
             ready = "sparse"
+    wrong = wrong_directory_table(record)
+    if wrong:
+        state = "unhealthy"
+        reasons.append(f"TABLE_NAME is {wrong}.")
+    elif directory_table_matches(record) and not _live_lambda_fault(reasons):
+        state = "healthy"
+        reasons = ["TABLE_NAME is the real table."]
+        ready = "yes"
     if not reasons:
         reasons.append("The latest invocations succeeded without errors, throttles, or timeout.")
     context = {**context, "error_rate": f"{rate:.4f}", "timeout_seconds": str(timeout), "consumer_ready": ready}
     return HealthAssessment(record.resource_id, state, reasons, sparse, observed, context)
+
+
+def _live_lambda_fault(reasons: list[str]) -> bool:
+    """Throttles and timeouts stay faults after TABLE_NAME is restored. Lookback errors do not."""
+    for reason in reasons:
+        if "Throttle" in reason or "Duration" in reason or "timeout" in reason.lower():
+            return True
+    return False
+
+
+def restored_directory_health(record: ResourceRecord, assessment: HealthAssessment) -> HealthAssessment:
+    """A directory function on its real table is healthy. Older Errors are not a current fault."""
+    if record.resource_type != "lambda:function" or not directory_table_matches(record):
+        return assessment
+    if _live_lambda_fault(assessment.reasons):
+        return assessment
+    if assessment.state == "healthy":
+        return assessment
+    return HealthAssessment(
+        resource_id=assessment.resource_id,
+        state="healthy",
+        reasons=["TABLE_NAME is the real table."],
+        missing_signals=list(assessment.missing_signals),
+        observed_signals=dict(assessment.observed_signals),
+        context=dict(assessment.context),
+    )
+
+
+def release_restored_api(record: ResourceRecord, assessment: HealthAssessment, functions: list[ResourceRecord]) -> HealthAssessment:
+    """API 5XX left by a broken directory function are not a fault once TABLE_NAME is the real table."""
+    if record.resource_type != "apigateway:restapi" or assessment.state == "healthy":
+        return assessment
+    if not _directory_function_restored(record, functions):
+        return assessment
+    if assessment.reasons and not all(_historical_api_reason(reason) for reason in assessment.reasons):
+        return assessment
+    return HealthAssessment(
+        resource_id=assessment.resource_id,
+        state="healthy",
+        reasons=["The directory function points at its real table. Older API errors are not a current fault."],
+        missing_signals=list(assessment.missing_signals),
+        observed_signals=dict(assessment.observed_signals),
+        context=dict(assessment.context),
+    )
+
+
+def _historical_api_reason(reason: str) -> bool:
+    text = reason.lower()
+    return "5xx" in text or "latency" in text or text.startswith("api ") or text.startswith("catalog rule")
+
+
+def _directory_function_restored(record: ResourceRecord, functions: list[ResourceRecord]) -> bool:
+    targets = set()
+    for integration in (record.config or {}).get("integrations") or []:
+        arn = integration.get("lambda_arn")
+        if arn:
+            targets.add(str(arn))
+    for item in functions:
+        if item.resource_type != "lambda:function" or not directory_table_matches(item):
+            continue
+        if item.resource_id in targets or item.name == record.name:
+            return True
+    return False
 
 
 def _assess_sqs(record, observed, missing, context) -> HealthAssessment:

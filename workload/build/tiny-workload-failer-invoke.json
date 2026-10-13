@@ -1,0 +1,1 @@
+{"errorMessage": "tiny-workload forced error", "errorType": "RuntimeError", "requestId": "d234e86c-1f4f-4f5f-bee9-9769016eedc6", "stackTrace": ["  File \"/var/task/handler.py\", line 45, in failer\n    raise RuntimeError(\"tiny-workload forced error\")\n"]}

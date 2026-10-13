@@ -92,6 +92,35 @@ def test_lambda_error_rate_and_ec2_status():
     assert "CPUUtilization" in " ".join(missing_cpu.reasons)
 
 
+def test_a_quiet_queue_with_no_datapoints_is_healthy():
+    from datetime import datetime, timezone
+
+    from sre_agent.monitoring.telemetry import sample
+
+    start = datetime(2026, 10, 9, tzinfo=timezone.utc)
+    end = datetime(2026, 10, 9, 0, 15, tzinfo=timezone.utc)
+    record = ResourceRecord(
+        resource_id="arn:aws:sqs:us-east-2:123456789012:quiet",
+        account_id="123456789012",
+        region="us-east-2",
+        resource_type="sqs:queue",
+        name="quiet",
+        config={"redrive_policy": {"deadLetterTargetArn": "arn:aws:sqs:us-east-2:123456789012:quiet-dlq"}},
+        presence="present",
+    )
+
+    class Reader:
+        def get_metric_data(self, *args, **kwargs):
+            return {}
+
+    assessment = sample(record, Reader(), start, end)
+    assert assessment.state == "healthy"
+    assert assessment.context.get("unreadable") != "yes"
+    assert "ApproximateAgeOfOldestMessage" not in assessment.missing_signals
+    assert assessment.observed_signals["ApproximateNumberOfMessagesVisible"] == 0
+    assert assessment.observed_signals["dlq.ApproximateNumberOfMessagesVisible"] == 0
+
+
 def test_batched_metrics_are_one_cloudwatch_call():
     from datetime import datetime, timezone
 

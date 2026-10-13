@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 
 from sre_agent.aws.errors import CloudError
+from sre_agent.aws.names import parse_arn, resource_name
 from sre_agent.integrations.confluence import CatalogRule, ConfluenceError
 from sre_agent.models import HealthAssessment
 
@@ -16,33 +17,39 @@ def apply_catalog(assessment: HealthAssessment, rules: list[CatalogRule], record
     observed = dict(assessment.observed_signals)
     missing = list(assessment.missing_signals)
     matched = []
+    skipped = []
     for rule in rules:
         if rule.resource_type != record.resource_type:
             continue
         try:
             matched.append(rule.resolved(_placeholders(record)))
         except ConfluenceError as exc:
-            state = _worse(state, "degraded")
-            reasons.append(f"Could not read catalog rule {rule.rule_id}: {exc}")
+            # An unresolved placeholder is not an outage. The rule is skipped.
+            skipped.append(f"Catalog rule {rule.rule_id} was not evaluated because {exc}.")
     if catalog_only and not matched:
-        return assessment
+        return _with_skips(assessment, skipped)
     for rule in matched:
         try:
             value, detail = _measure(rule, record, reader, start, end)
         except CloudError as exc:
-            state = _worse(state, "degraded")
-            missing.append(rule.signal)
-            reasons.append(f"Could not read {rule.signal} for catalog rule {rule.rule_id} v{rule.version} ({exc}).")
+            skipped.append(
+                f"Catalog rule {rule.rule_id} was not evaluated because {rule.signal} could not be read ({exc})."
+            )
             continue
         if value is None:
+            # CloudWatch omits a quiet series. That is zero, not a breach and not a missing signal.
             continue
         try:
             threshold = metric_math(rule.threshold_expression, {}) if rule.threshold_expression else rule.threshold
         except CloudError as exc:
-            state = _worse(state, "degraded")
-            reasons.append(f"Could not read the threshold for catalog rule {rule.rule_id} v{rule.version} ({exc}).")
+            skipped.append(
+                f"Catalog rule {rule.rule_id} was not evaluated because its threshold could not be read ({exc})."
+            )
             continue
-        observed[rule.signal] = float(value)
+        if _empty_queue_depth(record, assessment) and rule.signal == "ApproximateNumberOfMessagesVisible":
+            # A lookback Maximum can stay above the threshold after the queue and its DLQ are empty.
+            continue
+        observed[_catalog_signal_key(rule, record, observed)] = float(value)
         if _breached(value, rule.comparison, threshold):
             state = _worse(state, "degraded" if rule.role == "supporting" else "unhealthy")
             reasons.append(
@@ -51,7 +58,13 @@ def apply_catalog(assessment: HealthAssessment, rules: list[CatalogRule], record
     if state not in {"healthy", "degraded", "unhealthy"}:
         state = "degraded"
         reasons.append(f"Could not read {', '.join(missing) or 'a catalog signal'}.")
-    return HealthAssessment(record.resource_id, state, reasons, missing, observed, dict(assessment.context))
+    context = dict(assessment.context)
+    # Built-in pack health before the catalog overlay. A catalog hit must not hide a confirmed fault.
+    context["pack_state"] = "healthy" if catalog_only else assessment.state
+    return _with_skips(
+        HealthAssessment(record.resource_id, state, reasons, missing, observed, context),
+        skipped,
+    )
 
 
 def _measure(rule: CatalogRule, record, reader, start, end) -> tuple[float | None, str]:
@@ -71,9 +84,13 @@ def _measure(rule: CatalogRule, record, reader, start, end) -> tuple[float | Non
             dimensions=_dimensions(rule.dimension),
         )
         values = {name: aggregate_points(raw.get(name, []), "Sum", period) for name in names}
-        if any(value is None for value in values.values()):
+        if all(value is None for value in values.values()):
             return None, ""
-        return metric_math(rule.expression, {name: float(value) for name, value in values.items()}), rule.expression
+        filled = {name: 0.0 if value is None else float(value) for name, value in values.items()}
+        try:
+            return metric_math(rule.expression, filled), rule.expression
+        except CloudError:
+            return None, ""
     if rule.log_query:
         rows = reader.run_logs_query(
             record.account_id,
@@ -192,6 +209,19 @@ def _reduce_bucket(values: list[float], statistic: str) -> float:
     return float(sum(values))
 
 
+def _empty_queue_depth(record, assessment) -> bool:
+    """True when this queue has no visible messages and its DLQ is not holding any."""
+    if getattr(record, "resource_type", "") != "sqs:queue":
+        return False
+    observed = assessment.observed_signals or {}
+    if "ApproximateNumberOfMessagesVisible" not in observed:
+        return False
+    if float(observed["ApproximateNumberOfMessagesVisible"]) > 0:
+        return False
+    dlq = observed.get("dlq.ApproximateNumberOfMessagesVisible")
+    return dlq is None or float(dlq) <= 0
+
+
 def _breached(value: float, comparison: str, threshold: float) -> bool:
     if comparison == "GreaterThanThreshold":
         return value > threshold
@@ -202,6 +232,21 @@ def _breached(value: float, comparison: str, threshold: float) -> bool:
     raise CloudError(comparison)
 
 
+def _with_skips(assessment: HealthAssessment, skipped: list[str]) -> HealthAssessment:
+    if not skipped:
+        return assessment
+    context = dict(assessment.context)
+    context["catalog_skips"] = "; ".join(skipped)
+    return HealthAssessment(
+        assessment.resource_id,
+        assessment.state,
+        list(assessment.reasons),
+        list(assessment.missing_signals),
+        dict(assessment.observed_signals),
+        context,
+    )
+
+
 def _worse(current: str, new: str) -> str:
     rank = {"healthy": 0, "degraded": 1, "unhealthy": 2}
     if current not in rank:
@@ -209,6 +254,18 @@ def _worse(current: str, new: str) -> str:
     if new not in rank:
         new = "degraded"
     return new if rank[new] > rank[current] else current
+
+
+def _catalog_signal_key(rule: CatalogRule, record, observed: dict) -> str:
+    """A rule aimed at another resource must not replace this resource's own series."""
+    text = str(rule.dimension or "").strip()
+    if "=" not in text:
+        return rule.signal
+    dims = _dimensions(text) or []
+    foreign = any(item.get("Value") and item["Value"] != record.name for item in dims)
+    if foreign and rule.signal in observed:
+        return f"catalog.{rule.rule_id}.{rule.signal}"
+    return rule.signal
 
 
 def _dimensions(text: str) -> list[dict[str, str]] | None:
@@ -250,4 +307,15 @@ def _placeholders(record) -> dict[str, str]:
     policy = record.config.get("redrive_policy") or {}
     if isinstance(policy, dict) and policy.get("deadLetterTargetArn"):
         values["dlq"] = str(policy["deadLetterTargetArn"]).rsplit(":", 1)[-1]
+    api_id = str(record.config.get("api_id") or "")
+    if not api_id and record.resource_type == "apigateway:restapi":
+        try:
+            api_id = resource_name(parse_arn(record.resource_id))
+        except ValueError:
+            api_id = str(record.name or "")
+    if api_id:
+        values["api_id"] = api_id
+    stages = record.config.get("stages") or []
+    if isinstance(stages, list) and len(stages) == 1 and str(stages[0]).strip():
+        values["stage"] = str(stages[0]).strip()
     return values

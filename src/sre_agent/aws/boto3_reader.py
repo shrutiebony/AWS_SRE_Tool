@@ -107,6 +107,17 @@ class Boto3Reader:
 
         response, mappings = parallel_map(lambda fn: fn(), [configuration, mappings_for])
         configuration = response["Configuration"]
+        variables = (configuration.get("Environment") or {}).get("Variables") or {}
+        config = {
+            "timeout": configuration.get("Timeout"),
+            "memory": configuration.get("MemorySize"),
+            "runtime": configuration.get("Runtime"),
+            "last_modified": configuration.get("LastModified"),
+            "state": configuration.get("State"),
+        }
+        table_name = str(variables.get("TABLE_NAME") or "")
+        if table_name:
+            config["table_name"] = table_name
         return {
             "resource_id": configuration["FunctionArn"],
             "account_id": account_id,
@@ -114,13 +125,7 @@ class Boto3Reader:
             "resource_type": "lambda:function",
             "name": configuration["FunctionName"],
             "tags": {str(key): str(value) for key, value in dict(response.get("Tags") or {}).items()},
-            "config": {
-                "timeout": configuration.get("Timeout"),
-                "memory": configuration.get("MemorySize"),
-                "runtime": configuration.get("Runtime"),
-                "last_modified": configuration.get("LastModified"),
-                "state": configuration.get("State"),
-            },
+            "config": config,
             "event_source_mappings": mappings,
         }
 
@@ -183,6 +188,19 @@ class Boto3Reader:
         statuses = self._instance_statuses(region, [item["InstanceId"] for item in instances])
         items = [_normalize_instance(item, statuses.get(item["InstanceId"]), account_id, region) for item in instances]
         return Page(items, response.get("NextToken"))
+
+    def list_metric_alarms(self, region: str) -> list[dict]:
+        """Metric alarms in this region. Dimensions are flattened from simple and math metrics."""
+        client = self.client("cloudwatch", region)
+        paginator = client.get_paginator("describe_alarms")
+
+        def pages() -> list[dict]:
+            found: list[dict] = []
+            for page in paginator.paginate(AlarmTypes=["MetricAlarm"]):
+                found.extend(page.get("MetricAlarms") or [])
+            return found
+
+        return [_normalize_alarm(item) for item in self._invoke(pages)]
 
     def get_metric_data(
         self,
@@ -725,6 +743,37 @@ class Boto3Reader:
             if mapped is not None:
                 raise mapped from exc
             raise
+
+
+def _normalize_alarm(alarm: dict) -> dict:
+    return {
+        "name": str(alarm.get("AlarmName") or ""),
+        "state": str(alarm.get("StateValue") or ""),
+        "dimensions": _alarm_dimensions(alarm),
+    }
+
+
+def _alarm_dimensions(alarm: dict) -> list[dict[str, str]]:
+    found: list[dict[str, str]] = []
+
+    def add(items) -> None:
+        for item in items or []:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("Name") or item.get("name") or "")
+            value = str(item.get("Value") or item.get("value") or "")
+            if name and value:
+                found.append({"Name": name, "Value": value})
+
+    add(alarm.get("Dimensions"))
+    for metric in alarm.get("Metrics") or []:
+        if not isinstance(metric, dict):
+            continue
+        stat = metric.get("MetricStat") or {}
+        inner = stat.get("Metric") if isinstance(stat, dict) else {}
+        if isinstance(inner, dict):
+            add(inner.get("Dimensions"))
+    return found
 
 
 def metric_key(resource_id: str, name: str, stat: str | None, period: int | None, namespace: str | None, dimensions: list | None) -> tuple:

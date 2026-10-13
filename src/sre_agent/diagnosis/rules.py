@@ -11,6 +11,51 @@ from sre_agent.models import Diagnosis, Evidence, ProposedAction, ResourceRecord
 POISON_MARKERS = ("permanent_failure", "schema validation", "validation failed", "malformed", "poison", "invalid message")
 TRANSIENT_MARKERS = ("transient_failure", "timed out", "timeout", "throttl", "connection reset", "status code 503", "status code 502", "status code 429")
 REDRIVE = "sqs.redrive_dlq"
+_DIRECTORY_TABLES = {
+    "enterprise-sites-directory": "enterprise-sites",
+    "sre-dir-lab": "sre-dir-lab",
+}
+CHECKER_MACHINERY = (
+    "sre-agent-work-dlq",
+    "sre-agent-repair-dlq",
+    "sre-agent-worker",
+    "sre-agent-executor",
+    "sre-agent-registry",
+    "sre-agent-repair",
+    "sre-agent-work",
+)
+
+
+def wrong_directory_table(record) -> str:
+    """TABLE_NAME when a directory function does not point at its real table.
+
+    An empty value means this read did not see the setting. That is not a fault.
+    """
+    expected = _DIRECTORY_TABLES.get(str(getattr(record, "name", "") or ""))
+    if not expected:
+        return ""
+    actual = str((getattr(record, "config", None) or {}).get("table_name") or "")
+    if actual and actual != expected:
+        return actual
+    return ""
+
+
+def directory_table_matches(record) -> bool:
+    """True when this directory function's TABLE_NAME is the real table."""
+    expected = _DIRECTORY_TABLES.get(str(getattr(record, "name", "") or ""))
+    if not expected:
+        return False
+    actual = str((getattr(record, "config", None) or {}).get("table_name") or "")
+    return actual == expected
+
+
+def is_checker_machinery(*parts: str) -> bool:
+    """The checker's own queues and functions are not workload incidents."""
+    blob = " ".join(str(part) for part in parts if part)
+    for name in CHECKER_MACHINERY:
+        if re.search(rf"(?<![A-Za-z0-9_-]){re.escape(name)}(?![A-Za-z0-9_-])", blob):
+            return True
+    return False
 
 
 def classify_order(order_id: str, lines: list[str]) -> str:
@@ -91,6 +136,11 @@ def classify_logs(lines: list[str], status: str) -> str:
 
 
 def diagnose(snapshot, now: datetime) -> Diagnosis:
+    """Existing fault rules. A breaching alarm is evidence for a fault already found."""
+    return _with_breaching_alarm(snapshot, _diagnose_observed(snapshot, now))
+
+
+def _diagnose_observed(snapshot, now: datetime) -> Diagnosis:
     record = snapshot.record
     if record is None:
         return _diagnosis(
@@ -119,8 +169,9 @@ def diagnose(snapshot, now: datetime) -> Diagnosis:
             status="resolved",
             evidence=_signal_evidence(assessment),
         )
-    catalog_reasons = [reason for reason in assessment.reasons if "catalog rule" in reason.lower()]
-    if catalog_reasons:
+    catalog_reasons = _catalog_breach_reasons(assessment.reasons)
+    pack_state = assessment.context.get("pack_state", "")
+    if catalog_reasons and pack_state not in {"degraded", "unhealthy"}:
         return _diagnosis(
             snapshot,
             problem=plain_catalog_issue(catalog_reasons),
@@ -176,6 +227,8 @@ def _diagnose_sqs(snapshot, now: datetime) -> Diagnosis:
     dlq_visible = assessment.observed_signals.get("dlq.ApproximateNumberOfMessagesVisible")
     incoming = [item for item in snapshot.dependencies if item.kind == "dead_letters_to" and item.target_id == record.resource_id]
     if incoming and not dlq_id:
+        if not _own_backlog(assessment):
+            return _no_messages(snapshot, evidence)
         evidence.append(_relationship_evidence(incoming[0]))
         return _diagnosis(
             snapshot,
@@ -186,7 +239,7 @@ def _diagnose_sqs(snapshot, now: datetime) -> Diagnosis:
             evidence=evidence,
             causes=["Messages were redirected here by a redrive policy."],
         )
-    if any(_health(snapshot, item) == "unhealthy" for item in consumers):
+    if any(_health(snapshot, item) == "unhealthy" for item in consumers) and _own_backlog(assessment):
         evidence.append(_consumer_evidence(snapshot, consumers))
         return _diagnosis(
             snapshot,
@@ -197,7 +250,7 @@ def _diagnose_sqs(snapshot, now: datetime) -> Diagnosis:
             evidence=evidence,
             causes=["A consumer is unhealthy. Redriving messages would send work back to that consumer."],
         )
-    if not consumers:
+    if not consumers and _own_backlog(assessment):
         return _diagnosis(
             snapshot,
             problem="Queue backlog and no consumer relationship is recorded.",
@@ -207,6 +260,8 @@ def _diagnose_sqs(snapshot, now: datetime) -> Diagnosis:
             evidence=evidence,
             uncertainty=["The agent cannot tell a slow consumer from a stuck queue without a relationship."],
         )
+    if not _own_backlog(assessment) and not _dlq_holding(assessment):
+        return _no_messages(snapshot, evidence)
     evidence.append(_consumer_evidence(snapshot, consumers))
     if not dlq_id:
         return _diagnosis(
@@ -299,7 +354,58 @@ def _diagnose_lambda(snapshot, now: datetime) -> Diagnosis:
         uncertainty.append(
             "Terraform owns this function. A persistent change has to be made in configuration so the next apply does not undo it."
         )
-    if deploy:
+    errors = float(assessment.observed_signals.get("Errors") or 0)
+    throttles = float(assessment.observed_signals.get("Throttles") or 0)
+    from sre_agent.monitoring.alarms import alarm_sentence, breaching_alarm_names
+
+    alarm_names = breaching_alarm_names(assessment)
+    # Errors left by the missing table stay in the lookback after the restore.
+    # A directory alarm that is still ALARM is a current fault even when TABLE_NAME matches.
+    if directory_table_matches(record) and not alarm_names and throttles <= 0 and not _duration_timed_out(record, assessment):
+        return _diagnosis(
+            snapshot,
+            problem="No fault is currently observed.",
+            code="healthy",
+            health="healthy",
+            status="resolved",
+            evidence=evidence,
+        )
+    wrong = wrong_directory_table(record)
+    # The runnable repair is the table name. Errors from that wrong name are the same fault.
+    if wrong:
+        return _diagnosis(
+            snapshot,
+            problem=f"TABLE_NAME is {wrong}.",
+            code="lambda.errors_after_deploy",
+            health="unhealthy",
+            status="escalated",
+            evidence=evidence,
+            causes=[f"TABLE_NAME is {wrong}. The real table name is still the repair."],
+            uncertainty=uncertainty,
+        )
+    if alarm_names and record.name in _DIRECTORY_TABLES:
+        sentence = alarm_sentence(alarm_names)
+        return _diagnosis(
+            snapshot,
+            problem=sentence,
+            code="lambda.errors",
+            health="unhealthy",
+            status="escalated",
+            evidence=evidence,
+            causes=[sentence],
+            uncertainty=uncertainty,
+        )
+    # A new function's LastModified is recent. That is not an error ticket unless Errors moved.
+    if errors <= 0 and throttles <= 0 and not _duration_timed_out(record, assessment):
+        return _diagnosis(
+            snapshot,
+            problem="No fault is currently observed.",
+            code="healthy",
+            health="healthy",
+            status="resolved",
+            evidence=evidence,
+        )
+    if deploy and errors > 0:
         evidence.append(Evidence(id="ev-change", source="cloudtrail", summary=deploy, data={"last_modified": str(record.config.get("last_modified", ""))}))
         return _diagnosis(
             snapshot,
@@ -311,8 +417,6 @@ def _diagnose_lambda(snapshot, now: datetime) -> Diagnosis:
             causes=["A recent change is the leading explanation. This version does not roll back code."],
             uncertainty=uncertainty,
         )
-    throttles = assessment.observed_signals.get("Throttles", 0)
-    errors = assessment.observed_signals.get("Errors", 0)
     if throttles > 0 and errors == 0:
         code = "lambda.throttled"
         problem = "Lambda is throttling."
@@ -356,6 +460,36 @@ def _diagnose_ec2(snapshot) -> Diagnosis:
     )
 
 
+def _with_breaching_alarm(snapshot, diagnosis: Diagnosis) -> Diagnosis:
+    """A breaching alarm confirms a fault the checker already found.
+
+    A directory function whose alarm is ALARM is already diagnosed above.
+    A healthy read of any other resource stays healthy. A live fault with no
+    more specific diagnosis uses cloudwatch.alarm, which does not open a ticket.
+    """
+    from sre_agent.monitoring.alarms import alarm_sentence, breaching_alarm_names
+
+    names = breaching_alarm_names(getattr(snapshot, "assessment", None))
+    if not names:
+        return diagnosis
+    if diagnosis.health == "healthy" or diagnosis.problem_code == "healthy":
+        return diagnosis
+    if diagnosis.problem_code == "monitoring.unsupported":
+        sentence = alarm_sentence(names)
+        return _diagnosis(
+            snapshot,
+            problem=sentence,
+            code="cloudwatch.alarm",
+            health="unhealthy",
+            status="escalated",
+            evidence=_signal_evidence(snapshot.assessment),
+            causes=[sentence],
+        )
+    if diagnosis.health != "unhealthy":
+        diagnosis.health = "unhealthy"
+    return diagnosis
+
+
 def _diagnosis(snapshot, problem, code, health, status, evidence=None, causes=None, uncertainty=None, action=None) -> Diagnosis:
     uncertainty = list(uncertainty or [])
     uncertainty.extend(_lesson_notes(snapshot, code))
@@ -381,12 +515,35 @@ def plain_missing_issue(names: list[str]) -> str:
     return f"Required telemetry is missing: {', '.join(cleaned)}."
 
 
+def _catalog_breach_reasons(reasons: list[str]) -> list[str]:
+    """Only a rule that evaluated and crossed its threshold is a catalog fault."""
+    found = []
+    for reason in reasons:
+        if "catalog rule" not in reason.lower():
+            continue
+        if _breach_pairs(reason) or "outside its threshold" in reason.lower():
+            found.append(reason)
+    return found
+
+
 def plain_catalog_issue(reasons: list[str]) -> str:
-    """Plain-language catalog problem. Measured values and repeated errors stay out of the title."""
+    """Plain-language catalog problem. A measured breach wins over a rule that could not be read."""
     blob = " ".join(reasons)
     rule = _rule_id(blob)
+    breaches = [
+        (rule_id, signal)
+        for rule_id, signal in _breach_pairs(blob)
+        if "${" not in signal and not signal.startswith("$")
+    ]
+    if breaches:
+        sentences = []
+        for rule_id, signal in breaches:
+            sentence = f"Catalog rule {rule_id} shows {signal} outside its threshold."
+            if sentence not in sentences:
+                sentences.append(sentence)
+        return " ".join(sentences)
     placeholders = _placeholder_names(blob)
-    if placeholders or "unresolved placeholder" in blob.lower() or "has no value" in blob.lower():
+    if placeholders or "unresolved placeholder" in blob.lower() or "has no value" in blob.lower() or "was not evaluated" in blob.lower():
         if rule and placeholders:
             return f"Catalog rule {rule} cannot be evaluated because {', '.join(placeholders)} has no value."
         if rule:
@@ -397,14 +554,6 @@ def plain_catalog_issue(reasons: list[str]) -> str:
     missing = _missing_signal_names(blob)
     if missing:
         return plain_missing_issue(missing)
-    breaches = _breach_pairs(blob)
-    if breaches:
-        sentences = []
-        for rule_id, signal in breaches:
-            sentence = f"Catalog rule {rule_id} shows {signal} outside its threshold."
-            if sentence not in sentences:
-                sentences.append(sentence)
-        return " ".join(sentences)
     if rule:
         return f"Catalog rule {rule} is failing."
     return "A catalog rule is failing."
@@ -604,6 +753,37 @@ def _relationship_evidence(item) -> Evidence:
         summary=f"{item.kind} from {item.source_id} to {item.target_id}.",
         data=dict(item.evidence),
     )
+
+
+def _no_messages(snapshot, evidence) -> Diagnosis:
+    """An empty queue is not a backlog, even when a recent scan left it non-healthy."""
+    return _diagnosis(
+        snapshot,
+        problem="No fault is currently observed.",
+        code="healthy",
+        health="healthy",
+        status="resolved",
+        evidence=evidence,
+    )
+
+
+def _duration_timed_out(record, assessment) -> bool:
+    timeout = float(record.config.get("timeout") or 0)
+    duration = assessment.observed_signals.get("Duration")
+    if duration is None or timeout <= 0:
+        return False
+    return float(duration) >= timeout * 1000
+
+
+def _own_backlog(assessment) -> bool:
+    """Messages waiting on this queue. A dead-letter count is not this queue's backlog."""
+    visible = assessment.observed_signals.get("ApproximateNumberOfMessagesVisible")
+    return visible is not None and float(visible) > 0
+
+
+def _dlq_holding(assessment) -> bool:
+    visible = assessment.observed_signals.get("dlq.ApproximateNumberOfMessagesVisible")
+    return visible is not None and float(visible) > 0
 
 
 def _dlq_id(record: ResourceRecord) -> str:

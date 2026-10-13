@@ -21,18 +21,34 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from sre_agent.cli import run_live_cycle
-from sre_agent.demo_mail import CLEANUP_MAIL, SIMULATION_MAIL, deliver_mail, load_recipients, save_recipients
+from sre_agent.demo_mail import (
+    CLEANUP_MAIL,
+    SIMULATION_MAIL,
+    add_recipient,
+    applied_mail,
+    delete_recipient,
+    deliver_mail,
+    load_recipients,
+    confirm_verification,
+    close_mail,
+    save_recipients,
+    verification_status,
+)
 from sre_agent.demo_plans import (
     NOT_RUN,
     NOT_RUNNABLE,
     ALIASES,
     allows_apply,
+    directory_restore_function,
+    explicit_lab_target,
+    is_instruction,
     lab_target_ids,
     plan_for,
+    resolved_proposal,
     ticket_decision,
     ticket_plan,
 )
-from sre_agent.integrations.confluence import FakeConfluence, load_catalog
+from sre_agent.integrations.confluence import FakeConfluence, catalog_sections, load_catalog
 from sre_agent.local_config import get, load_local_config
 
 HOST = "127.0.0.1"
@@ -40,6 +56,7 @@ PORT = 8765
 REGION = ""
 ACCOUNT = ""
 DIRECTORY = "enterprise-sites-directory"
+DIRECTORY_ABSENT = "The directory function is not in this account."
 LIVE_TABLE = "enterprise-sites"
 EXTRA_TABLE = "demo-extra-sites"
 TOPIC_NAME = "demo-alerts"
@@ -168,6 +185,8 @@ class Demo:
         self.scanned_at = ""
         self.catalog_status = "not-configured"
         self.catalog_types: list[str] = []
+        self.catalog_sections: list[dict] = []
+        self.catalog_read_error = ""
         self.scan_notes: list[str] = []
         self.directory_issue_key = ""
         self.directory_note = ""
@@ -181,6 +200,11 @@ class Demo:
         self.issue_links: dict[str, dict] = {}
         self.issue_views: list[dict] = []
         self.jira_error = ""
+        self.jira_client = None
+        self.directory_closed = False
+        self.directory_changed = False
+        self.redrive_settle_attempts = 4
+        self.redrive_settle_pause = 3
 
     def set_phase(self, text: str, *, log: bool = False) -> None:
         safe = public_text(text)
@@ -218,7 +242,7 @@ class Demo:
         print(safe, flush=True)
 
     def fail(self, exc: BaseException) -> None:
-        detail = _error_text(exc)
+        detail = DIRECTORY_ABSENT if _directory_waiter_error(exc) else _error_text(exc)
         with self._lock:
             self.error = detail
             self.message = "The last action failed."
@@ -233,18 +257,33 @@ class Demo:
         self.finish(f"Baseline inventory completed. {count} resources.")
         self._log_rows()
 
+    def open_health(self) -> None:
+        """Read the account before drawing the page. A return from Jira reads it again."""
+        self.ensure_fresh()
+
     def ensure_fresh(self) -> None:
         """Read the account before drawing the page. A previous scan is not reused."""
         while not self.try_begin():
             time.sleep(0.25)
         try:
-            self.set_phase("Running inventory.", log=True)
-            self._inventory(display=True)
-            count = sum(1 for row in self.rows if row.get("presence") in {"present", ""})
-            self.finish(f"Baseline inventory completed. {count} resources.")
-            self._log_rows()
+            self._display_scan()
         except Exception as exc:
-            self.fail(exc)
+            if not _expired_token(exc):
+                self.fail(exc)
+                return
+            try:
+                refresh_aws_login(force=True)
+                self._display_scan()
+            except Exception as retry_exc:
+                self.fail(retry_exc)
+
+    def _display_scan(self) -> None:
+        self.set_phase("Running inventory.", log=True)
+        self._inventory(display=True)
+        self._read_catalog()
+        count = sum(1 for row in self.rows if row.get("presence") in {"present", ""})
+        self.finish(f"Baseline inventory completed. {count} resources.")
+        self._log_rows()
 
     def _log_rows(self) -> None:
         for row in self.rows:
@@ -343,64 +382,27 @@ class Demo:
         self.mail_note = deliver_mail("SRE agent: enterprise-sites-directory unhealthy", self.directory_note)
         self.finish(self.directory_note)
 
-    def restore_directory(self, *, mail: bool = True, close: str = "always", issue_key: str = "") -> None:
-        if issue_key:
-            self.directory_issue_key = issue_key
-        self.set_phase("Pointing enterprise-sites-directory at TABLE_NAME=enterprise-sites.", log=True)
-        self._set_directory_table(LIVE_TABLE)
-        self.set_phase("Configuration update is active. Invoking the sites URL.", log=True)
-        codes = _invoke_sites()
-        mark = datetime.now(timezone.utc)
-        self.set_phase(
-            "Sites URL responses: " + _codes(codes) + ". Waiting for a period with successful invocations and no errors.",
-            log=True,
-        )
-
-        def ready() -> bool:
-            errors = _lambda_metric("Errors", mark - timedelta(minutes=3))
-            invocations = _lambda_metric("Invocations", mark - timedelta(minutes=3))
-            recent = [
-                point
-                for point in invocations
-                if _aware(point["Timestamp"]) >= mark - timedelta(seconds=90) and float(point.get("Sum") or 0) > 0
-            ]
-            if not recent:
-                return False
-            newest = max(recent, key=lambda point: _aware(point["Timestamp"]))
-            ok_at = _aware(newest["Timestamp"])
-            matched = [point for point in errors if _aware(point["Timestamp"]) >= ok_at - timedelta(seconds=5)]
-            if not matched:
-                return False
-            latest = max(matched, key=lambda point: _aware(point["Timestamp"]))
-            return float(latest.get("Sum") or 0) == 0
-
-        seen = self._wait(
-            minimum=60,
-            maximum=90,
-            label="Waiting for a clean Lambda period after the restore.",
-            ready=ready,
-        )
-        self.set_phase("Running inventory.", log=True)
-        self._inventory()
-        health, code = self._directory_health()
-        clean = "A clean CloudWatch period was visible." if seen else "A clean CloudWatch period was not visible within 90 seconds."
+    def restore_directory(
+        self,
+        *,
+        mail: bool = True,
+        close: str = "always",
+        issue_key: str = "",
+        display: bool = False,
+        function_name: str = "",
+        table_name: str = "",
+    ) -> None:
+        del display
+        function_name = function_name or DIRECTORY
+        table_name = table_name or LIVE_TABLE
+        note, closed = self._apply_directory_restore(function_name, table_name, issue_key)
+        self.directory_note = note
+        self.directory_closed = closed
         if close == "healthy":
-            resource_id = ""
-            for row in self.rows:
-                if row["name"] == DIRECTORY and row["resource_type"] == "lambda:function":
-                    resource_id = row.get("resource_id", "")
-                    break
-            closed = self._close_if_healthy(issue_key or self.directory_issue_key, resource_id, DIRECTORY, "lambda:function")
-        else:
-            closed = self._close_verified_ticket()
-        self.directory_note = (
-            f"TABLE_NAME is enterprise-sites. Responses {_codes(codes)}. {clean} "
-            f"Directory health is {health or 'not in this inventory'}. Problem code {code or 'none'}. "
-            f"{closed}"
-        )
+            return
         if mail:
-            self.mail_note = deliver_mail("SRE agent: enterprise-sites-directory restored", self.directory_note)
-        self.finish(self.directory_note)
+            self.mail_note = deliver_mail(f"SRE agent: {function_name} restored", note)
+        self.finish(note)
 
     def show_close(self) -> None:
         self.set_phase("Running python -m sre_agent lab.", log=True)
@@ -515,7 +517,12 @@ class Demo:
         refresh_aws_login()
         os.environ.pop("SRE_SERVICE_LIST_URI", None)
         report, agent = run_live_cycle(ACCOUNT, REGION, display=display)
+        if display:
+            agent.publish_health_board(report)
         self.agent = agent
+        note = getattr(agent, "last_mail_note", "") or ""
+        if note:
+            self.mail_note = note
         self._apply(report, agent)
 
     def _close_verified_ticket(self) -> str:
@@ -536,13 +543,47 @@ class Demo:
             client.close(key)
         except Exception as exc:
             return f"{key} was not closed. {public_text(str(exc))}"
+        self.mail_note = self._mail_on_close(key)
+        self.close_mailed = True
         return f"{key} was closed {phrase}."
+
+    def _mail_on_close(self, key: str) -> str:
+        """The close mail goes to the fixed address, even when the saved list is empty."""
+        report = getattr(self, "mail_report", None)
+        if isinstance(report, dict):
+            return close_mail(
+                key,
+                str(report.get("happened") or ""),
+                str(report.get("cause") or ""),
+                str(report.get("action") or ""),
+                str(report.get("delta") or ""),
+            )
+        return close_mail(key)
 
     def _close_if_healthy(self, key: str, resource_id: str = "", name: str = "", resource_type: str = "") -> str:
         health, code = self._health_for(resource_id, name, resource_type)
         if health == "healthy":
             return self._close_issue(key)
-        return _stay_open(health, code)
+        note = _stay_open(health, code)
+        self._note_issue(key, "Verified action ran. " + note)
+        return note
+
+    def _note_issue(self, key: str, body: str) -> None:
+        """Update the Jira issue. This does not close it."""
+        if not key:
+            return
+        client = getattr(self, "jira_client", None)
+        if client is None:
+            client = getattr(getattr(self, "agent", None), "jira", None)
+        if client is None or not hasattr(client, "add_note"):
+            if os.environ.get("PYTEST_CURRENT_TEST"):
+                return
+            from sre_agent.worker import _jira
+
+            client = _jira()
+        if client is None or not hasattr(client, "add_note"):
+            return
+        client.add_note(key, body)
 
     def _health_for(self, resource_id: str = "", name: str = "", resource_type: str = "") -> tuple[str, str]:
         for row in self.rows:
@@ -557,33 +598,137 @@ class Demo:
         view = self._issue_view(key)
         if view is None:
             raise RuntimeError(f"{key} is not an open issue in this project.")
-        if proposed.strip():
-            view = {**view, "proposed": proposed.strip()}
+        view = {**view, "proposed": _posted_proposal(view, proposed)}
         decision = _decision_for(view)
         if not decision["run"]:
-            note = "The edited action was not run. The ticket stays open."
+            note = "This issue has no correction this page can run."
             self.ticket_notes[key] = note
-            self.mail_note = "Mail was not sent."
             self.finish(note)
             return
         if decision["kind"] == "restore-directory":
-            self.restore_directory(mail=False, close="healthy", issue_key=key)
-            self.ticket_notes[key] = self.directory_note
-            self.mail_note = "Mail was not sent."
+            self.restore_directory(
+                mail=False,
+                close="healthy",
+                issue_key=key,
+                display=True,
+                function_name=str(decision.get("function_name") or ""),
+                table_name=str(decision.get("table_name") or ""),
+            )
+            self._finish_verified(
+                key,
+                self.directory_note,
+                self.directory_closed,
+                applied=self.directory_changed,
+            )
             return
         if decision["kind"] == "redrive":
             note = self._run_lab_redrive(decision["target"], view.get("resource_name", ""))
-            self.set_phase("Running inventory.", log=True)
-            self._inventory()
-            closed = self._close_if_healthy(key, decision["target"], view.get("resource_name", ""), view.get("resource_type", ""))
-            text = f"{note} {closed}"
-            self.ticket_notes[key] = text
-            self.mail_note = "Mail was not sent."
-            self.finish(text)
+            closed, did_close = self._finish_redrive(
+                key,
+                decision["target"],
+                view.get("resource_name", ""),
+                note,
+            )
+            self._finish_verified(
+                key,
+                f"{note} {closed}".strip(),
+                did_close,
+                applied="sqs.redrive_dlq ran" in (note or ""),
+            )
             return
         self.ticket_notes[key] = NOT_RUNNABLE
-        self.mail_note = "Mail was not sent."
         self.finish(NOT_RUNNABLE)
+
+    def _finish_verified(self, key: str, text: str, _closed: bool, *, applied: bool = True) -> None:
+        """Mail once the verified AWS action has been applied, including when the ticket then closes."""
+        self.ticket_notes[key] = text
+        if getattr(self, "close_mailed", False):
+            self.finish(text)
+            return
+        report = getattr(self, "mail_report", None)
+        if "was closed" in text and isinstance(report, dict):
+            self.mail_note = close_mail(
+                key,
+                str(report.get("happened") or ""),
+                str(report.get("cause") or ""),
+                str(report.get("action") or ""),
+                str(report.get("delta") or ""),
+            )
+        elif "was closed" in text:
+            self.mail_note = close_mail(key)
+        elif applied:
+            self.mail_note = applied_mail(key, text)
+        else:
+            self.mail_note = "Mail was not sent because the verified action was not applied."
+        self.finish(text)
+
+    def _finish_redrive(self, key: str, resource_id: str, name: str, note: str) -> tuple[str, bool]:
+        """Read this queue a few times. Close only when visible messages and the DLQ depth are zero."""
+        if "sqs.redrive_dlq ran" not in (note or ""):
+            stayed = "The ticket stays open because sqs.redrive_dlq did not clear the queue."
+            self._note_issue(key, "Verified action ran. " + note + " " + stayed)
+            return stayed, False
+        if "sre-agent" in f"{resource_id} {name}".lower():
+            stayed = "The ticket stays open because an sre-agent queue is not redriven."
+            self._note_issue(key, stayed)
+            return stayed, False
+        attempts = max(1, int(self.redrive_settle_attempts))
+        pause = max(0.0, float(self.redrive_settle_pause))
+        last = "The ticket stays open because the queue was not read."
+        for attempt in range(1, attempts + 1):
+            self.set_phase("Reading the lab queue after sqs.redrive_dlq.", log=True)
+            try:
+                visible, dlq_depth = self._read_queue_depths(resource_id)
+            except Exception as exc:
+                last = "The ticket stays open because the queue could not be read. " + public_text(exc)
+                self._note_issue(key, "Verified action ran. " + last)
+                return last, False
+            if visible == 0 and dlq_depth == 0:
+                closed = self._close_issue(key)
+                return closed, bool(key) and closed.startswith(f"{key} was closed")
+            last = (
+                f"Visible messages are {visible} and the dead-letter depth is {dlq_depth}. "
+                "The ticket stays open because the queue is not empty."
+            )
+            if attempt >= attempts:
+                self._note_issue(key, "Verified action ran. " + last)
+                return last, False
+            self.set_phase("Waiting a few seconds to read the lab queue again.", log=True)
+            time.sleep(pause)
+        return last, False
+
+    def _read_queue_depths(self, resource_id: str) -> tuple[int, int]:
+        """Visible messages on this queue and the depth of its dead-letter queue."""
+        if "sre-agent" in (resource_id or "").lower():
+            raise RuntimeError("Refusing to read an sre-agent queue.")
+        refresh_aws_login()
+        import boto3
+
+        region, url = _sqs_target(resource_id)
+        client = boto3.Session(region_name=region).client("sqs", region_name=region)
+        attrs = client.get_queue_attributes(
+            QueueUrl=url,
+            AttributeNames=["ApproximateNumberOfMessages", "RedrivePolicy"],
+        )["Attributes"]
+        visible = int(attrs.get("ApproximateNumberOfMessages") or 0)
+        policy = attrs.get("RedrivePolicy")
+        dlq_arn = ""
+        if policy:
+            dlq_arn = str(json.loads(policy).get("deadLetterTargetArn") or "")
+        if "sre-agent" in dlq_arn.lower():
+            raise RuntimeError("Refusing to read an sre-agent dead-letter queue.")
+        if not dlq_arn:
+            return visible, 0
+        _dlq_region, dlq_url = _sqs_target(dlq_arn)
+        if _dlq_region == region:
+            dlq_client = client
+        else:
+            dlq_client = boto3.Session(region_name=_dlq_region).client("sqs", region_name=_dlq_region)
+        dlq_attrs = dlq_client.get_queue_attributes(
+            QueueUrl=dlq_url,
+            AttributeNames=["ApproximateNumberOfMessages"],
+        )["Attributes"]
+        return visible, int(dlq_attrs.get("ApproximateNumberOfMessages") or 0)
 
     def _run_lab_redrive(self, resource_id: str, name: str) -> str:
         from sre_agent.demo_plans import explicit_lab_target
@@ -596,6 +741,12 @@ class Demo:
         agent = getattr(self, "agent", None)
         registry = getattr(agent, "registry", None)
         record = registry.get_by_resource_id(resource_id) if registry is not None else None
+        if record is None and registry is not None:
+            wanted = resource_id.rsplit(":", 1)[-1]
+            for item in registry.list_resources():
+                if item.resource_id == resource_id or item.name == wanted or item.name == name:
+                    record = item
+                    break
         if record is None or not explicit_lab_target(record.resource_id, record.name, targets):
             return NOT_RUN
         self.set_phase("Checking the lab queue before sqs.redrive_dlq.", log=True)
@@ -605,19 +756,27 @@ class Demo:
         lines: list[str] = []
         for read in snapshot.logs.values():
             lines.extend(getattr(read, "lines", []) or [])
-        eligible, _rejected, notes = order_outcomes(list(getattr(snapshot, "dlq_messages", []) or []), lines)
-        if not eligible:
-            detail = notes[0] if notes else "No verified transient orders to replay."
-            return f"sqs.redrive_dlq did not move messages. {public_text(detail)}"
+        eligible, _rejected, _notes = order_outcomes(list(getattr(snapshot, "dlq_messages", []) or []), lines)
         policy = (record.config or {}).get("redrive_policy") or {}
         dlq = str(policy.get("deadLetterTargetArn") or "")
         if not dlq:
-            return "sqs.redrive_dlq did not move messages. The queue has no dead-letter target."
-        reader = _reader_for(agent.scope, record.account_id)
-        if reader is None or not hasattr(reader, "replay_orders"):
+            return "sqs.redrive_dlq did not run. The queue has no dead-letter target."
+        if "sre-agent" in dlq.lower():
             return NOT_RUN
-        result = reader.replay_orders(record.account_id, record.region, record.resource_id, dlq, eligible)
-        return f"sqs.redrive_dlq ran on the lab target. Moved {result.get('moved', 0)}."
+        reader = _reader_for(agent.scope, record.account_id)
+        if reader is None:
+            return NOT_RUN
+        if eligible and hasattr(reader, "replay_orders"):
+            result = reader.replay_orders(record.account_id, record.region, record.resource_id, dlq, eligible)
+            return f"sqs.redrive_dlq ran on the lab target. Moved {result.get('moved', 0)}."
+        if not hasattr(reader, "start_message_move_task"):
+            return NOT_RUN
+        try:
+            result = reader.start_message_move_task(record.account_id, record.region, record.resource_id, dlq)
+        except Exception as exc:
+            return "sqs.redrive_dlq did not run. " + public_text(exc)
+        status = str((result or {}).get("status") or "started")
+        return f"sqs.redrive_dlq ran on the lab target. Move task {status}."
 
     def prepare_plan(self, action: str, payload: dict) -> dict:
         if action == "ticket":
@@ -630,48 +789,28 @@ class Demo:
         view = self._issue_view(key)
         if view is None:
             return {"ok": False, "applied": False, "error": f"{key} is not an open issue in this project."}
-        if proposed.strip():
-            view = {**view, "proposed": proposed.strip()}
+        view = {**view, "proposed": _posted_proposal(view, proposed)}
         return ticket_plan(key, _decision_for(view), REGION, proposed=str(view.get("proposed") or ""))
 
     def populate_workload(self, fields: dict) -> None:
-        from sre_agent.integrations.confluence import (
-            storage_has_service,
-            validate_workload_fields,
-            workload_section,
-        )
-        from sre_agent.worker import _confluence
+        del fields
+        raise RuntimeError("This page does not change Confluence.")
 
-        error = validate_workload_fields(fields)
-        if error:
-            raise RuntimeError(error)
-        client = _confluence()
-        if client is None or not hasattr(client, "fetch_document"):
-            raise RuntimeError("Confluence is not configured.")
-        self.set_phase("Reading the Confluence page.", log=True)
-        version, title, storage, space_id = client.fetch_document()
-        service = str(fields.get("service") or "").strip()
-        resource_type = str(fields.get("resource_type") or "").strip()
-        heading = f"Service: {service} ({resource_type})"
-        if storage_has_service(storage, service, resource_type):
-            note = f"{heading} is already on the Confluence page."
-            self.catalog_note = note
-            self.mail_note = ""
-            self.finish(note)
+    def _read_catalog(self) -> None:
+        """Read the stored catalog for the page. This does not write Confluence."""
+        if os.environ.get("PYTEST_CURRENT_TEST"):
             return
-        section = workload_section(fields, storage)
-        self.set_phase(f"Adding {heading}.", log=True)
-        client.write_storage(title, storage + section, version, space_id)
-        note = f"Added {heading} to the Confluence page."
-        self.catalog_note = note
-        self.mail_note = ""
-        self.finish(note)
+        sections, error = read_catalog_sections()
+        self.catalog_sections = sections
+        self.catalog_read_error = error
 
     def _issue_view(self, key: str) -> dict | None:
         views, _error = self.issues_for_page()
         for view in views:
             if view.get("key") == key:
-                return view
+                linked = _linked_issue(view, self.rows)
+                linked["proposed"] = resolved_proposal(linked, str(linked.get("proposed") or ""))
+                return linked
         return None
 
     def issues_for_page(self) -> tuple[list[dict], str]:
@@ -744,12 +883,15 @@ class Demo:
                 self.directory_issue_key = diagnosis.jira_issue_key
             if diagnosis.jira_issue_key and record is not None:
                 action = diagnosis.proposed_action
-                links[diagnosis.jira_issue_key] = {
+                candidate = {
                     "resource_id": diagnosis.resource_id,
                     "name": record.name,
                     "resource_type": record.resource_type,
                     "target": action.target_resource_id if action is not None else diagnosis.resource_id,
                 }
+                current = links.get(diagnosis.jira_issue_key)
+                if current is None or not _directory_link(current) or _directory_link(candidate):
+                    links[diagnosis.jira_issue_key] = candidate
         self.issue_links = links
         rows = []
         for record in sorted(report.resources, key=lambda item: (item.resource_type, item.name.lower())):
@@ -773,7 +915,9 @@ class Demo:
                 scanned.append(scan.scanned_at)
             if scan.collector == "reconciliation":
                 continue
-            if scan.status in {"error", "denied", "partial"}:
+            if scan.status == "note":
+                notes.append(public_text(scan.message))
+            elif scan.status in {"error", "denied", "partial"}:
                 notes.append(f"{scan.collector} ({scan.region}) {scan.status}: {public_text(scan.message)}")
         self.report = report
         self.rows = rows
@@ -782,29 +926,194 @@ class Demo:
         self.catalog_status = agent.catalog_status
         self.catalog_types = sorted({rule.resource_type for rule in agent.catalog_rules})
 
-    def _set_directory_table(self, table_name: str) -> None:
-        if table_name not in {LIVE_TABLE, "missing-table"}:
+    def _apply_directory_restore(self, function_name: str, table_name: str, issue_key: str) -> tuple[str, bool]:
+        """Run the proposed TABLE_NAME change, then close after that value is read back."""
+        if function_name.startswith("sre-agent") or function_name == "enterprise-sites":
+            raise RuntimeError("Refusing to change " + function_name)
+        allowed = {(DIRECTORY, LIVE_TABLE), ("sre-dir-lab", "sre-dir-lab")}
+        if (function_name, table_name) not in allowed:
+            raise RuntimeError(NOT_RUNNABLE)
+        if issue_key:
+            self.directory_issue_key = issue_key
+        key = issue_key or self.directory_issue_key
+        self.directory_changed = False
+        self.mail_report = None
+        self.close_mailed = False
+        before = ""
+        try:
+            before = self._read_function_table(function_name)
+        except Exception as exc:
+            self.set_phase("Could not read TABLE_NAME before the update. " + public_text(str(exc)), log=True)
+        self.set_phase(
+            f"TABLE_NAME was {before or 'unset'}. Setting {function_name} TABLE_NAME to {table_name}.",
+            log=True,
+        )
+        self._set_directory_table(table_name, function_name=function_name)
+        self.directory_changed = True
+        self.set_phase(f"Reading TABLE_NAME on {function_name}.", log=True)
+        actual = self._read_function_table(function_name)
+        if actual != table_name:
+            stayed = f"TABLE_NAME was {before or 'unset'}. TABLE_NAME is {actual or 'unset'}. The ticket stays open because TABLE_NAME is not {table_name}."
+            self._remember_directory_mail(key, function_name, before, actual or "unset", "The function was not invoked.", "The ticket stays open.")
+            self._note_issue(key, "Verified action ran. " + stayed)
+            return stayed, False
+        failure = self._invoke_function(function_name)
+        if failure:
+            stayed = (
+                f"TABLE_NAME was {before or 'unset'}. TABLE_NAME is {table_name}. {failure} "
+                "The ticket stays open because the function invoke failed."
+            )
+            self._remember_directory_mail(key, function_name, before, table_name, failure, "The ticket stays open.")
+            self._note_issue(key, "Verified action ran. " + stayed)
+            return stayed, False
+        alarm_note = self._set_lab_alarm_ok(function_name) if function_name == "sre-dir-lab" else ""
+        if function_name == "sre-dir-lab" and " is OK." not in alarm_note:
+            stayed = (
+                f"TABLE_NAME was {before or 'unset'}. TABLE_NAME is {table_name}. "
+                f"The function was invoked and returned success. {alarm_note} "
+                "The ticket stays open because the CloudWatch alarm is still ALARM."
+            )
+            self._remember_directory_mail(key, function_name, before, table_name, alarm_note, "The ticket stays open.")
+            self._note_issue(key, "Verified action ran. " + stayed)
+            return stayed, False
+        done = f"The function was invoked and returned success. {alarm_note}".strip()
+        self._remember_directory_mail(key, function_name, before, table_name, done, f"{key} was closed because health is healthy.")
+        closed = self._close_issue(key)
+        did_close = bool(key) and closed.startswith(f"{key} was closed")
+        if did_close:
+            self.directory_issue_key = ""
+        return (
+            f"TABLE_NAME was {before or 'unset'}. TABLE_NAME is {table_name}. "
+            f"{done} {closed}"
+        ), did_close
+
+    def _remember_directory_mail(self, key: str, function_name: str, before: str, after: str, action: str, ticket: str) -> None:
+        """The mail for this Verify click: what happened, why, what changed, and the delta."""
+        previous = before or "unset"
+        if previous == after:
+            cause = (
+                f"TABLE_NAME on {function_name} was already {after}. "
+                "CloudWatch alarm sre-dir-lab-lambda-errors was still ALARM from earlier Lambda errors."
+            )
+        else:
+            cause = (
+                f"TABLE_NAME on {function_name} was {previous}. "
+                "The function could not read the directory table, so Lambda errors put the alarm in ALARM."
+            )
+        alarm_after = "OK" if " is OK." in action else "still ALARM"
+        ticket_after = "closed" if "was closed" in ticket else "still open"
+        self.mail_report = {
+            "happened": (
+                f"CloudWatch alarm sre-dir-lab-lambda-errors was in ALARM. "
+                f"The checker showed {function_name} as unhealthy and opened {key or 'a Jira ticket'}."
+            ),
+            "cause": cause,
+            "action": f"Set TABLE_NAME on {function_name} to {after}. {action} {ticket}".strip(),
+            "delta": (
+                f"TABLE_NAME: {previous} -> {after}\n"
+                f"Alarm sre-dir-lab-lambda-errors: ALARM -> {alarm_after}\n"
+                f"Jira {key or 'ticket'}: open -> {ticket_after}"
+            ),
+        }
+
+    def _read_function_table(self, function_name: str) -> str:
+        """The TABLE_NAME env var on this function after the configuration update."""
+        if not function_name or function_name.startswith("sre-agent"):
+            raise RuntimeError("Refusing to read " + function_name)
+        refresh_aws_login()
+        import boto3
+
+        client = boto3.Session(region_name=REGION).client("lambda", region_name=REGION)
+        config = client.get_function_configuration(FunctionName=function_name)
+        variables = (config.get("Environment") or {}).get("Variables") or {}
+        return str(variables.get("TABLE_NAME") or "")
+
+    def _invoke_function(self, function_name: str) -> str:
+        """Invoke the function. An empty string means AWS returned success."""
+        if function_name.startswith("sre-agent"):
+            raise RuntimeError("Refusing to invoke " + function_name)
+        refresh_aws_login()
+        import boto3
+
+        client = boto3.Session(region_name=REGION).client("lambda", region_name=REGION)
+        self.set_phase(f"Invoking {function_name}.", log=True)
+        response = client.invoke(FunctionName=function_name, InvocationType="RequestResponse", Payload=b"{}")
+        if response.get("FunctionError"):
+            return _invoke_failure(response) or "The invoke failed."
+        status = int(response.get("StatusCode") or 0)
+        if status >= 300:
+            return f"The invoke returned status {status}."
+        return ""
+
+    def _set_lab_alarm_ok(self, function_name: str) -> str:
+        """Leave the lab alarm OK only when CloudWatch agrees and the error window is clear."""
+        if function_name != "sre-dir-lab":
+            return ""
+        refresh_aws_login()
+        import boto3
+
+        name = "sre-dir-lab-lambda-errors"
+        client = boto3.Session(region_name=REGION).client("cloudwatch", region_name=REGION)
+        reason = "The directory function was invoked successfully after TABLE_NAME was set."
+        deadline = time.monotonic() + 120
+        last = ""
+        try:
+            while True:
+                client.set_alarm_state(AlarmName=name, StateValue="OK", StateReason=reason)
+                last = _alarm_state(client, name)
+                errors = _recent_lambda_errors(client, function_name)
+                if last == "OK" and (errors is None or errors < 1):
+                    return f"CloudWatch alarm {name} is OK."
+                if time.monotonic() >= deadline:
+                    break
+                time.sleep(5)
+            if last == "OK":
+                errors = _recent_lambda_errors(client, function_name)
+                if errors is None or errors < 1:
+                    return f"CloudWatch alarm {name} is OK."
+        except Exception as exc:
+            if "ResourceNotFound" in public_text(str(exc)):
+                return ""
+            return "The CloudWatch alarm was not changed. " + public_text(str(exc))
+        shown = last or "ALARM"
+        return f"CloudWatch alarm {name} is still {shown}."
+
+    def _set_directory_table(self, table_name: str, function_name: str = "") -> None:
+        function_name = function_name or DIRECTORY
+        allowed = {
+            (DIRECTORY, LIVE_TABLE),
+            (DIRECTORY, "missing-table"),
+            ("sre-dir-lab", "sre-dir-lab"),
+        }
+        if (function_name, table_name) not in allowed or function_name.startswith("sre-agent"):
             raise RuntimeError("Refusing to set an unexpected table name.")
         refresh_aws_login()
         import boto3
 
         client = boto3.Session(region_name=REGION).client("lambda", region_name=REGION)
-        waiter = client.get_waiter("function_updated")
-        config = {"Delay": 2, "MaxAttempts": 40}
-        waiter.wait(FunctionName=DIRECTORY, WaiterConfig=config)
+
+        def _write() -> None:
+            current = client.get_function_configuration(FunctionName=function_name)
+            variables = dict((current.get("Environment") or {}).get("Variables") or {})
+            variables["TABLE_NAME"] = table_name
+            client.update_function_configuration(
+                FunctionName=function_name,
+                Environment={"Variables": variables},
+            )
+
         try:
-            client.update_function_configuration(
-                FunctionName=DIRECTORY,
-                Environment={"Variables": {"TABLE_NAME": table_name}},
-            )
-        except client.exceptions.ResourceConflictException:
-            waiter.wait(FunctionName=DIRECTORY, WaiterConfig=config)
-            client.update_function_configuration(
-                FunctionName=DIRECTORY,
-                Environment={"Variables": {"TABLE_NAME": table_name}},
-            )
-        self.set_phase(f"Waiting until the configuration update for TABLE_NAME={table_name} is active.", log=True)
-        waiter.wait(FunctionName=DIRECTORY, WaiterConfig=config)
+            try:
+                _write()
+            except client.exceptions.ResourceNotFoundException as exc:
+                raise RuntimeError(DIRECTORY_ABSENT) from exc
+            except client.exceptions.ResourceConflictException:
+                _wait_function_ready(client, function_name)
+                _write()
+            _wait_function_ready(client, function_name)
+        except Exception as exc:
+            if _directory_waiter_error(exc):
+                raise RuntimeError(DIRECTORY_ABSENT) from None
+            raise
 
     def _directory_health(self) -> tuple[str, str]:
         for row in self.rows:
@@ -867,6 +1176,152 @@ class Demo:
             time.sleep(1)
 
 
+def read_catalog_sections() -> tuple[list[dict], str]:
+    """Fetch the catalog page and parse the sections already stored there."""
+    from sre_agent.worker import _confluence
+
+    client = _confluence()
+    if client is None or not hasattr(client, "fetch_page"):
+        return [], "Confluence is not configured."
+    try:
+        _version, storage = client.fetch_page()
+        return catalog_sections(storage), ""
+    except Exception as exc:
+        return [], public_text(exc)
+
+
+def _catalog_skip_note(note: str) -> bool:
+    """Unevaluable catalog rules and a failed catalog fetch stay off the page."""
+    lowered = (note or "").lower()
+    if "was not evaluated" in lowered or "resourcenotfoundexception" in lowered:
+        return True
+    if "catalog load failed" in lowered or "http error 404" in lowered:
+        return True
+    return "catalog rule" in lowered and ("could not be read" in lowered or "log group" in lowered or "${" in note)
+
+
+def _shown_scan_notes(notes: list[str]) -> list[str]:
+    return [note for note in notes if not _catalog_skip_note(note)]
+
+
+_SERVICE_NAMES = {
+    "sqs": "SQS",
+    "lambda": "Lambda",
+    "dynamodb": "DynamoDB",
+    "api gateway": "API Gateway",
+    "sns": "SNS",
+    "eks": "EKS",
+    "ec2": "EC2",
+}
+_COMPARE_WORDS = {
+    ">": "above",
+    ">=": "at or above",
+    "<": "below",
+    "GreaterThanThreshold": "above",
+    "GreaterThanOrEqualToThreshold": "at or above",
+    "LessThanThreshold": "below",
+}
+
+
+def catalog_service_name(heading: str) -> str:
+    """The service a person recognizes. The stored heading is not the title."""
+    text = (heading or "").strip()
+    if text.lower().startswith("service:"):
+        text = text.split(":", 1)[1].strip()
+    name = text
+    resource_type = ""
+    match = re.fullmatch(r"(.+?)\s*\(([a-z0-9]+:[a-z0-9_-]+)\)", text, flags=re.IGNORECASE)
+    if match:
+        name = match.group(1).strip()
+        resource_type = match.group(2).lower()
+    elif re.fullmatch(r"[a-z0-9]+:[a-z0-9_-]+", text, flags=re.IGNORECASE):
+        resource_type = text.lower()
+        name = ""
+    if resource_type in TYPE_LABELS:
+        return TYPE_LABELS[resource_type]
+    return _SERVICE_NAMES.get(name.lower(), name)
+
+
+def _usable(value: str) -> str:
+    text = (value or "").strip()
+    if not text or "${" in text or _catalog_skip_note(text):
+        return ""
+    return text
+
+
+def _metric_why(item: dict) -> str:
+    """Plain language from the condition, threshold, and role. Empty parts are left out."""
+    measure = _usable(str(item.get("measure") or ""))
+    condition = _usable(str(item.get("condition") or ""))
+    threshold = _usable(str(item.get("threshold") or ""))
+    role = _usable(str(item.get("role") or "")).lower()
+    word = _COMPARE_WORDS.get(condition, "")
+    if measure and word and threshold:
+        if role == "supporting":
+            return f"Supporting signal. Degraded when {measure} is {word} {threshold}."
+        return f"Unhealthy when {measure} is {word} {threshold}."
+    if role == "supporting":
+        return "Supporting signal."
+    return ""
+
+
+def _metric_row_html(item: dict) -> str:
+    measure = _usable(str(item.get("measure") or ""))
+    symptom = _usable(str(item.get("symptom") or ""))
+    if not measure or not symptom:
+        return ""
+    why = _metric_why(item)
+    return (
+        "<tr>"
+        f"<td>{html.escape(measure)}</td>"
+        f"<td>{html.escape(why)}</td>"
+        f"<td>{html.escape(symptom)}</td>"
+        "</tr>"
+    )
+
+
+def _catalog_view_html(sections: list[dict], error: str) -> str:
+    """One card per catalog service. Opening a card shows that service's metrics."""
+    cards = []
+    for section in sections or []:
+        heading = str(section.get("heading") or "").strip()
+        if not heading or _catalog_skip_note(heading) or "${" in heading:
+            continue
+        label = catalog_service_name(heading)
+        if not label:
+            continue
+        body_rows = []
+        for item in section.get("rows") or []:
+            row = _metric_row_html(item)
+            if row:
+                body_rows.append(row)
+        count = len(body_rows)
+        count_label = "1 metric" if count == 1 else f"{count} metrics"
+        if body_rows:
+            table = (
+                "<table><thead><tr><th>Metric</th><th>Why</th><th>Symptom ID</th></tr></thead>"
+                f"<tbody>{''.join(body_rows)}</tbody></table>"
+            )
+        else:
+            table = "<p class='meta'>No metrics are listed for this service.</p>"
+        cards.append(
+            "<details class='catalog-card'>"
+            "<summary class='catalog-toggle'>"
+            f"<span class='catalog-name'>{html.escape(label)}</span>"
+            f"<span class='catalog-count'>{count_label}</span>"
+            "</summary>"
+            f"<div class='catalog-detail'>{table}</div>"
+            "</details>"
+        )
+    if cards:
+        return "<div class='catalog-grid'>" + "".join(cards) + "</div>"
+    if error and not _catalog_skip_note(error):
+        return f"<p class='meta'>{html.escape(error)}</p>"
+    if error:
+        return ""
+    return "<p class='meta'>No service sections are on the Confluence page.</p>"
+
+
 def shown_health(value: str) -> str:
     """Health words the page may show. The word unknown is never one of them."""
     text = (value or "").strip().lower()
@@ -894,12 +1349,26 @@ def _fallback_problem(record) -> str:
     return ""
 
 
+def _moved_count(note: str) -> int:
+    match = re.search(r"\bMoved (\d+)\b", note or "")
+    if match is None:
+        return 0
+    return int(match.group(1))
+
+
 def _stay_open(health: str, code: str) -> str:
     state = shown_health(health) if health else "degraded"
     text = f"Health is {state}."
     if code and code != "healthy":
         text += f" Problem code {code}."
     return text + " The ticket stays open because health is not healthy."
+
+
+def _posted_proposal(view: dict, proposed: str) -> str:
+    text = (proposed or "").strip()
+    if text and not is_instruction(text):
+        return text
+    return resolved_proposal(view, text)
 
 
 def _decision_for(view: dict) -> dict:
@@ -910,7 +1379,82 @@ def _decision_for(view: dict) -> dict:
         resource_id=str(view.get("resource_id") or ""),
         resource_type=str(view.get("resource_type") or ""),
         lab_targets=lab_target_ids(),
+        where_seen=str(view.get("where_seen") or view.get("task") or ""),
     )
+
+
+def _directory_link(link: dict) -> bool:
+    """A directory restore belongs to the function, not another resource that shares its name."""
+    return (
+        str(link.get("resource_type") or "") == "lambda:function"
+        and str(link.get("name") or "") in {"enterprise-sites-directory", "sre-dir-lab"}
+    )
+
+
+def _linked_issue(view: dict, rows: list[dict]) -> dict:
+    """Fill the resource from the card text when the page did not write the Jira link."""
+    linked = dict(view)
+    wanted = directory_restore_function(str(linked.get("proposed") or ""))
+    if wanted:
+        for row in rows:
+            if row.get("name") == wanted and str(row.get("resource_type") or "") in {"", "lambda:function"}:
+                linked["resource_id"] = str(row.get("resource_id") or "")
+                linked["resource_name"] = str(row.get("name") or wanted)
+                linked["resource_type"] = str(row.get("resource_type") or "lambda:function")
+                return linked
+        current_type = str(linked.get("resource_type") or "")
+        current_name = str(linked.get("resource_name") or "")
+        if current_type in {"", "lambda:function"} and current_name in {"", wanted}:
+            if not current_name:
+                linked["resource_name"] = wanted
+            if not current_type:
+                linked["resource_type"] = "lambda:function"
+            return linked
+        linked["resource_id"] = ""
+        linked["resource_name"] = wanted
+        linked["resource_type"] = "lambda:function"
+        return linked
+    if linked.get("resource_id") and linked.get("resource_name") and linked.get("resource_type"):
+        return linked
+    blob = "\n".join(
+        str(linked.get(name) or "")
+        for name in ("where_seen", "task", "summary", "situation", "proposed")
+    )
+    matches = [row for row in rows if _row_mentioned(row, blob)]
+    chosen = _choose_issue_row(matches, str(linked.get("proposed") or ""))
+    if chosen is None:
+        return linked
+    linked["resource_id"] = linked.get("resource_id") or chosen.get("resource_id") or ""
+    linked["resource_name"] = linked.get("resource_name") or chosen.get("name") or ""
+    linked["resource_type"] = linked.get("resource_type") or chosen.get("resource_type") or ""
+    return linked
+
+
+def _row_mentioned(row: dict, blob: str) -> bool:
+    resource_id = str(row.get("resource_id") or "")
+    name = str(row.get("name") or "")
+    if resource_id and resource_id in blob:
+        return True
+    if name and re.search(rf"(?:^|[\s|]){re.escape(name)}(?:$|[\s|])", blob):
+        return True
+    return False
+
+
+def _choose_issue_row(matches: list[dict], proposed: str) -> dict | None:
+    if not matches:
+        return None
+    if "sqs.redrive_dlq" in proposed:
+        targets = lab_target_ids()
+        for row in matches:
+            if explicit_lab_target(str(row.get("resource_id") or ""), str(row.get("name") or ""), targets):
+                return row
+    table_match = re.search(r"TABLE_NAME\s*(=|to)\s*(enterprise-sites|sre-dir-lab)\b", proposed, re.IGNORECASE)
+    if table_match:
+        wanted = "enterprise-sites-directory" if table_match.group(2).lower() == "enterprise-sites" else "sre-dir-lab"
+        for row in matches:
+            if row.get("name") == wanted and row.get("resource_type") in {None, "", "lambda:function"}:
+                return row
+    return matches[0]
 
 
 def _browse(key: str) -> str:
@@ -926,8 +1470,9 @@ def _row_cells(row: dict) -> str:
     if code == "healthy":
         code = ""
     detail = code
-    if code and row.get("problem"):
-        detail = code + " " + row["problem"]
+    problem = row.get("problem") or ""
+    if code and problem and not _catalog_skip_note(problem):
+        detail = code + " " + problem
     return (
         f"<td>{html.escape(row['name'])}</td>"
         + f"<td>{html.escape(row['resource_type'])}</td>"
@@ -971,6 +1516,9 @@ def _issue_cards(issues: list[dict], error: str) -> str:
         note = issue.get("note") or ""
         note_html = f"<p class='result'>{html.escape(note)}</p>" if note else ""
         proposed = html.escape(issue.get("proposed") or "")
+        button = ""
+        if _decision_for(issue).get("run"):
+            button = f"<button type='button' class='ticket-run' data-issue='{key}'>Take this action</button>"
         cards.append(
             "<article class='card'>"
             f"<header>{key_html}<span class='status-pill'>{html.escape(issue.get('status') or 'Open')}</span></header>"
@@ -978,7 +1526,7 @@ def _issue_cards(issues: list[dict], error: str) -> str:
             f"<h3>Where seen</h3><p class='where'>{html.escape(issue.get('where_seen') or issue.get('task') or '')}</p>"
             f"<label>Proposed solution<textarea class='proposed'>{proposed}</textarea></label>"
             f"{note_html}"
-            f"<button type='button' class='ticket-run' data-issue='{key}'>Take this action</button>"
+            f"{button}"
             "</article>"
         )
     return "<div class='board'>\n" + "\n".join(cards) + "\n</div>"
@@ -1011,7 +1559,7 @@ def _wait_for_topic(session) -> bool:
     return False
 
 
-def _lambda_metric(name: str, start: datetime) -> list[dict]:
+def _lambda_metric(name: str, start: datetime, function_name: str = "") -> list[dict]:
     refresh_aws_login()
     import boto3
 
@@ -1019,7 +1567,7 @@ def _lambda_metric(name: str, start: datetime) -> list[dict]:
     response = client.get_metric_statistics(
         Namespace="AWS/Lambda",
         MetricName=name,
-        Dimensions=[{"Name": "FunctionName", "Value": DIRECTORY}],
+        Dimensions=[{"Name": "FunctionName", "Value": function_name or DIRECTORY}],
         StartTime=start,
         EndTime=datetime.now(timezone.utc),
         Period=60,
@@ -1078,6 +1626,148 @@ def _confluence_url() -> str:
     return ""
 
 
+def _directory_waiter_error(exc: BaseException) -> bool:
+    """True when a directory update hit a function that is not in this account."""
+    text = str(exc).lower()
+    missing = "resourcenotfoundexception" in text or "function not found" in text
+    if "functionupdated" in text and missing:
+        return True
+    if DIRECTORY in text and missing:
+        return True
+    response = getattr(exc, "response", None) or getattr(exc, "last_response", None)
+    if isinstance(response, dict):
+        error = response.get("Error") or {}
+        if isinstance(error, dict):
+            code = str(error.get("Code") or "")
+            message = str(error.get("Message") or "")
+            blob = f"{text} {message}".lower()
+            if code == "ResourceNotFoundException" and DIRECTORY in blob:
+                return True
+    return False
+
+
+def _sqs_target(resource_id: str) -> tuple[str, str]:
+    """Region and queue URL for an SQS ARN or URL."""
+    text = (resource_id or "").strip()
+    if text.startswith("https://"):
+        host = text.split("/")[2]
+        region = host.split(".")[1] if host.startswith("sqs.") else REGION
+        return region, text
+    parts = text.split(":")
+    if len(parts) >= 6 and parts[2] == "sqs":
+        region, account, name = parts[3], parts[4], parts[5]
+        return region, f"https://sqs.{region}.amazonaws.com/{account}/{name}"
+    raise RuntimeError("The queue address could not be read.")
+
+
+def _wait_function_ready(client, function_name: str) -> None:
+    """Poll until the configuration update is active. The first check does not sleep."""
+    for attempt in range(12):
+        current = client.get_function_configuration(FunctionName=function_name)
+        status = str(current.get("LastUpdateStatus") or "")
+        if status in {"", "Successful"}:
+            return
+        if status == "Failed":
+            reason = str(current.get("LastUpdateStatusReason") or "The configuration update failed.")
+            raise RuntimeError(public_text(reason))
+        if attempt < 11:
+            time.sleep(0.4)
+    raise RuntimeError("The configuration update did not become active.")
+
+
+def _alarm_state(client, name: str) -> str:
+    response = client.describe_alarms(AlarmNames=[name])
+    alarms = response.get("MetricAlarms") or []
+    if not alarms:
+        return ""
+    return str(alarms[0].get("StateValue") or "")
+
+
+def _recent_lambda_errors(client, function_name: str) -> float | None:
+    """Newest one-minute Lambda error sum. None means CloudWatch has no point in the window."""
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(minutes=3)
+    response = client.get_metric_statistics(
+        Namespace="AWS/Lambda",
+        MetricName="Errors",
+        Dimensions=[{"Name": "FunctionName", "Value": function_name}],
+        StartTime=start,
+        EndTime=end,
+        Period=60,
+        Statistics=["Sum"],
+    )
+    points = list(response.get("Datapoints") or [])
+    if not points:
+        return None
+    newest = max(points, key=lambda item: item.get("Timestamp"))
+    return float(newest.get("Sum") or 0)
+
+
+def _invoke_failure(response: dict) -> str:
+    """A short invoke error. The payload body is not shown."""
+    raw = b""
+    payload = response.get("Payload")
+    if payload is not None and hasattr(payload, "read"):
+        raw = payload.read()
+    text = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else str(raw or "")
+    kind = ""
+    try:
+        parsed = json.loads(text) if text else {}
+    except json.JSONDecodeError:
+        parsed = {}
+    if isinstance(parsed, dict):
+        kind = str(parsed.get("errorType") or "")
+    if kind:
+        return "The invoke failed: " + public_text(kind)[:120]
+    return "The invoke failed."
+
+
+def _function_exists(client, function_name: str) -> bool:
+    if not function_name or function_name.startswith("sre-agent"):
+        return False
+    try:
+        client.get_function(FunctionName=function_name)
+    except Exception as exc:
+        missing = getattr(getattr(client, "exceptions", None), "ResourceNotFoundException", ())
+        if (missing and isinstance(exc, missing)) or _directory_waiter_error(exc):
+            return False
+        raise
+    return True
+
+
+def _directory_function_exists(client) -> bool:
+    try:
+        client.get_function(FunctionName=DIRECTORY)
+    except Exception as exc:
+        missing = getattr(getattr(client, "exceptions", None), "ResourceNotFoundException", ())
+        if (missing and isinstance(exc, missing)) or _directory_waiter_error(exc):
+            return False
+        raise
+    return True
+
+
+def _clear_stale_directory_failure(demo: Demo) -> None:
+    """Drop a stored directory waiter failure when the board has no open issues."""
+    with demo._lock:
+        blob = " ".join([demo.error, demo.message, demo.phase])
+        if not _directory_failure_text(blob):
+            return
+        demo.error = ""
+        if demo.message == "The last action failed." or _directory_failure_text(demo.message):
+            demo.message = ""
+        if demo.phase.startswith("The last action failed.") or _directory_failure_text(demo.phase):
+            demo.phase = ""
+
+
+def _directory_failure_text(text: str) -> bool:
+    lowered = (text or "").lower()
+    if "functionupdated" in lowered:
+        return True
+    if DIRECTORY_ABSENT.lower() in lowered:
+        return True
+    return DIRECTORY in lowered and ("resourcenotfoundexception" in lowered or "function not found" in lowered)
+
+
 def _error_text(exc: BaseException) -> str:
     response = getattr(exc, "response", None)
     if isinstance(response, dict):
@@ -1112,28 +1802,81 @@ def refresh_aws_login(*, force: bool = False) -> None:
         _login_deadline = _credential_deadline()
 
 
-def _export_aws_login() -> None:
-    global _session_expires_at
-    command = ["aws", "configure", "export-credentials", "--format", "process"]
+def _cli_login_env() -> dict[str, str]:
+    """Environment for `aws configure export-credentials`.
+
+    A copied session in this process must not be visible to that command.
+    The CLI treats those variables as the credentials to export, so a later
+    refresh would keep handing back the same expired token.
+    """
+    env = dict(os.environ)
+    for name in (
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+        "AWS_SECURITY_TOKEN",
+    ):
+        env.pop(name, None)
+    return env
+
+
+def _aws_cli(args: list[str]) -> list[str]:
     profile = get("AWS_PROFILE")
     if profile:
-        command = ["aws", "--profile", profile, "configure", "export-credentials", "--format", "process"]
-    completed = subprocess.run(
-        command,
+        return ["aws", "--profile", profile, *args]
+    return ["aws", *args]
+
+
+def _export_aws_login() -> None:
+    """Copy a CLI login session into this process. A dead session starts sign-in and tries once more."""
+    if _apply_exported_credentials(_export_credentials()):
+        return
+    _start_aws_login()
+    if _apply_exported_credentials(_export_credentials()):
+        return
+    raise RuntimeError("AWS sign-in did not finish. Reload this page to try again.")
+
+
+def _export_credentials() -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        _aws_cli(["configure", "export-credentials", "--format", "process"]),
         capture_output=True,
         text=True,
         check=False,
+        env=_cli_login_env(),
     )
-    if completed.returncode != 0 or not completed.stdout.strip():
-        raise RuntimeError("AWS CLI login credentials are not available. Run aws login, then start this server again.")
+
+
+def _start_aws_login() -> None:
+    """Open the AWS CLI sign-in. The page waits for it instead of stopping."""
+    print("AWS sign-in is starting.", flush=True)
+    try:
+        subprocess.run(
+            _aws_cli(["login"]),
+            check=False,
+            env=_cli_login_env(),
+            timeout=600,
+        )
+    except subprocess.TimeoutExpired:
+        return
+
+
+def _apply_exported_credentials(completed: subprocess.CompletedProcess[str]) -> bool:
+    """Store a usable export. An empty or expired export is not stored."""
+    global _session_expires_at
+    if completed.returncode != 0 or not (completed.stdout or "").strip():
+        return False
     try:
         payload = json.loads(completed.stdout)
-    except json.JSONDecodeError as exc:
-        raise RuntimeError("AWS CLI login credentials could not be read.") from exc
+    except json.JSONDecodeError:
+        return False
     access = str(payload.get("AccessKeyId") or "")
     secret = str(payload.get("SecretAccessKey") or "")
     if not access or not secret:
-        raise RuntimeError("AWS CLI login credentials were incomplete.")
+        return False
+    expires = _parse_expiration(str(payload.get("Expiration") or ""))
+    if expires is not None and expires <= datetime.now(timezone.utc) + timedelta(seconds=30):
+        return False
     os.environ["AWS_ACCESS_KEY_ID"] = access
     os.environ["AWS_SECRET_ACCESS_KEY"] = secret
     token = str(payload.get("SessionToken") or "")
@@ -1143,7 +1886,32 @@ def _export_aws_login() -> None:
         os.environ.pop("AWS_SESSION_TOKEN", None)
     os.environ["AWS_DEFAULT_REGION"] = REGION
     os.environ["AWS_REGION"] = REGION
-    _session_expires_at = _parse_expiration(str(payload.get("Expiration") or ""))
+    _session_expires_at = expires
+    return True
+
+
+def _expired_token(exc: BaseException) -> bool:
+    text = f"{_error_text(exc)} {exc}".lower()
+    return "expiredtoken" in text or "security token included in the request is expired" in text
+
+
+def _mail_with_login(call):
+    """Refresh the AWS login, then run one SES check. Retry once if that token is already dead."""
+    try:
+        refresh_aws_login(force=True)
+    except Exception as exc:
+        return {"ok": False, "message": public_text(exc)}
+    result = call()
+    text = str(result.get("message") or "") if isinstance(result, dict) else ""
+    if isinstance(result, dict) and result.get("ok") is False and (
+        _expired_token(RuntimeError(text)) or "AWS login expired" in text
+    ):
+        try:
+            refresh_aws_login(force=True)
+        except Exception as exc:
+            return {"ok": False, "message": public_text(exc)}
+        result = call()
+    return result
 
 
 def _parse_expiration(raw: str) -> datetime | None:
@@ -1271,6 +2039,37 @@ th { color: var(--muted); font-weight: 650; }
 .health.unhealthy { background: var(--red-bg); color: var(--red); }
 .health.degraded { background: var(--amber-bg); color: var(--amber); }
 .notes { background: var(--amber-bg); color: var(--amber); border-radius: 4px; padding: 8px 10px; margin-bottom: 10px; }
+.catalog-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  gap: 10px;
+  margin-top: 10px;
+}
+details.catalog-card {
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 12px 14px;
+}
+details.catalog-card[open] {
+  grid-column: 1 / -1;
+  background: #fff;
+  border-color: var(--accent);
+}
+summary.catalog-toggle {
+  cursor: pointer;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+  min-height: 72px;
+  list-style: none;
+}
+summary.catalog-toggle::-webkit-details-marker { display: none; }
+.catalog-name { font-size: 18px; font-weight: 650; line-height: 1.2; }
+.catalog-count { color: var(--muted); font-size: 13px; }
+.catalog-detail { margin-top: 12px; }
 label { display: block; font-size: 13px; color: var(--muted); margin: 8px 0; }
 .hint { display: block; font-size: 12px; }
 input, select, textarea {
@@ -1327,7 +2126,7 @@ article.card header { display: flex; justify-content: space-between; gap: 8px; a
 .situation, .where { margin: 0; white-space: pre-wrap; }
 .card h3 { font-size: 13px; font-weight: 650; margin: 8px 0 2px; }
 .result { white-space: pre-wrap; background: var(--panel-2); border-radius: 4px; padding: 8px; font-size: 13px; }
-#facts-overlay, #verify-overlay, #test-overlay, #conditions-overlay {
+#facts-overlay, #verify-overlay, #mail-verify-overlay {
   position: fixed;
   inset: 0;
   background: rgba(0, 0, 0, 0.55);
@@ -1337,7 +2136,7 @@ article.card header { display: flex; justify-content: space-between; gap: 8px; a
   padding: 24px;
   z-index: 5;
 }
-#facts-overlay[hidden], #verify-overlay[hidden], #test-overlay[hidden], #conditions-overlay[hidden] { display: none; }
+#facts-overlay[hidden], #verify-overlay[hidden], #mail-verify-overlay[hidden] { display: none; }
 #conditions-overlay .popup { width: min(1100px, 100%); }
 .popup {
   width: min(560px, 100%);
@@ -1402,6 +2201,11 @@ async function openPlan(action, extra) {
   document.getElementById("verify-items").textContent = (body.items || []).join("\\n");
   applyBtn.textContent = body.button || "Verify and apply";
   applyBtn.dataset.simulate = body.requires_verify ? "false" : "true";
+  if (body.will_run === false) {
+    applyBtn.hidden = true;
+    return;
+  }
+  applyBtn.hidden = false;
   applyBtn.disabled = false;
   applyBtn.focus();
 }
@@ -1433,6 +2237,9 @@ if (applyBtn) {
       const body = await response.json();
       applied = body.applied === true;
       document.getElementById("verify-lead").textContent = body.message || body.error || "";
+      if (applied) {
+        document.getElementById("verify-items").textContent = "";
+      }
       if (mailEl) {
         mailEl.hidden = false;
         mailEl.textContent = body.mail || body.error || "";
@@ -1451,22 +2258,8 @@ if (applyBtn) {
     }
   });
 }
-const testTool = document.getElementById("test-tool");
-if (testTool) {
-  testTool.addEventListener("click", () => {
-    document.getElementById("test-overlay").hidden = false;
-  });
-}
-const testClose = document.getElementById("test-close");
-if (testClose) {
-  testClose.addEventListener("click", () => {
-    document.getElementById("test-overlay").hidden = true;
-  });
-}
 document.querySelectorAll("button[data-plan]").forEach(button => {
   button.addEventListener("click", () => {
-    const testOverlay = document.getElementById("test-overlay");
-    if (testOverlay) testOverlay.hidden = true;
     openPlan(button.dataset.plan, {});
   });
 });
@@ -1496,19 +2289,131 @@ document.querySelectorAll(".type-toggle").forEach(button => {
     }
   });
 });
+function fillAddresses(addresses) {
+  const select = document.getElementById("saved-addresses");
+  if (!select) return;
+  select.replaceChildren();
+  const saved = Array.isArray(addresses) ? addresses : [];
+  if (!saved.length) {
+    const option = document.createElement("option");
+    option.value = "";
+    option.textContent = "No addresses are saved";
+    select.appendChild(option);
+    return;
+  }
+  saved.forEach(address => {
+    const option = document.createElement("option");
+    option.value = address;
+    option.textContent = address;
+    select.appendChild(option);
+  });
+}
 const saveEmails = document.getElementById("save-emails");
 if (saveEmails) {
   saveEmails.addEventListener("click", async () => {
+    const field = document.getElementById("new-address");
     const response = await fetch("/api/emails", {
       method: "POST",
       headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({addresses: document.getElementById("mail-addresses").value}),
+      body: JSON.stringify({address: field ? field.value : ""}),
     });
     const body = await response.json();
     document.getElementById("email-status").textContent = body.message || "";
     if (body.ok && Array.isArray(body.addresses)) {
-      document.getElementById("mail-addresses").value = body.addresses.join("\\n");
+      fillAddresses(body.addresses);
+      const added = field ? field.value.trim() : "";
+      if (field) field.value = "";
+      if (added) openMailVerify(added);
     }
+  });
+}
+function openMailVerify(address) {
+  const overlay = document.getElementById("mail-verify-overlay");
+  const title = document.getElementById("mail-verify-address");
+  const note = document.getElementById("mail-verify-note");
+  const status = document.getElementById("email-status");
+  if (title) title.textContent = address;
+  if (note) note.textContent = "Checking this address with Amazon…";
+  if (status) status.textContent = "Checking this address with Amazon…";
+  if (overlay) overlay.hidden = false;
+  sendMailVerification(address);
+}
+async function sendMailVerification(address) {
+  const note = document.getElementById("mail-verify-note");
+  const status = document.getElementById("email-status");
+  const response = await fetch("/api/emails", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({verify: address}),
+  });
+  const body = await response.json();
+  const message = body.message || "";
+  if (note) note.textContent = message;
+  if (status) status.textContent = message;
+}
+const mailVerifySend = document.getElementById("mail-verify-send");
+if (mailVerifySend) {
+  mailVerifySend.addEventListener("click", () => {
+    const address = document.getElementById("mail-verify-address");
+    if (address && address.textContent) sendMailVerification(address.textContent);
+  });
+}
+const mailVerifyCheck = document.getElementById("mail-verify-check");
+if (mailVerifyCheck) {
+  mailVerifyCheck.addEventListener("click", async () => {
+    const address = document.getElementById("mail-verify-address");
+    const note = document.getElementById("mail-verify-note");
+    if (!address || !address.textContent) return;
+    const response = await fetch("/api/emails", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({check: address.textContent}),
+    });
+    const body = await response.json();
+    const message = body.message || "";
+    if (note) note.textContent = message;
+    const status = document.getElementById("email-status");
+    if (status) status.textContent = message;
+  });
+}
+const mailVerifyClose = document.getElementById("mail-verify-close");
+if (mailVerifyClose) {
+  mailVerifyClose.addEventListener("click", () => {
+    const overlay = document.getElementById("mail-verify-overlay");
+    if (overlay) overlay.hidden = true;
+  });
+}
+const verifyEmail = document.getElementById("verify-email");
+if (verifyEmail) {
+  verifyEmail.addEventListener("click", () => {
+    const select = document.getElementById("saved-addresses");
+    const selected = select ? select.value : "";
+    const status = document.getElementById("email-status");
+    if (!selected) {
+      if (status) status.textContent = "No addresses are saved.";
+      return;
+    }
+    openMailVerify(selected);
+  });
+}
+const deleteEmail = document.getElementById("delete-email");
+if (deleteEmail) {
+  deleteEmail.addEventListener("click", async () => {
+    const select = document.getElementById("saved-addresses");
+    const selected = select ? select.value : "";
+    const status = document.getElementById("email-status");
+    if (!selected) {
+      if (status) status.textContent = "No addresses are saved.";
+      return;
+    }
+    const response = await fetch("/api/emails", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({delete: selected}),
+    });
+    const body = await response.json();
+    if (status) status.textContent = body.message || "";
+    if (body.ok && Array.isArray(body.addresses)) fillAddresses(body.addresses);
   });
 }
 const factsOpen = document.getElementById("facts-open");
@@ -1516,82 +2421,6 @@ const facts = document.getElementById("facts-overlay");
 if (factsOpen && facts) {
   factsOpen.addEventListener("click", () => { facts.hidden = false; });
   document.getElementById("facts-close").addEventListener("click", () => { facts.hidden = true; });
-}
-const workload = document.getElementById("workload-form");
-const populate = document.getElementById("populate");
-function conditionValues() {
-  return Array.from(document.querySelectorAll("#condition-rows .condition-row")).map(row => ({
-    condition: (row.querySelector("[data-field=condition]") || {}).value || "",
-    threshold: (row.querySelector("[data-field=threshold]") || {}).value || "",
-    kind: (row.querySelector("[data-field=kind]") || {}).value || "",
-    namespace: (row.querySelector("[data-field=namespace]") || {}).value || "",
-  })).map(row => ({
-    condition: String(row.condition).trim(),
-    threshold: String(row.threshold).trim(),
-    kind: String(row.kind).trim(),
-    namespace: String(row.namespace).trim(),
-  }));
-}
-function conditionReady(row) {
-  return [">", ">=", "<"].includes(row.condition)
-    && row.threshold
-    && ["metric", "log"].includes(row.kind)
-    && row.namespace;
-}
-function catalogReady() {
-  if (!workload) return false;
-  const data = Object.fromEntries(new FormData(workload));
-  const required = ["service", "resource_type", "measure", "dimension", "stat", "window", "role"];
-  const filled = required.every(name => String(data[name] || "").trim());
-  const windowOk = /^[1-9][0-9]*$/.test(String(data.window || "").trim());
-  const dimensionOk = String(data.dimension || "").includes("=");
-  const shared = filled && windowOk && dimensionOk
-    && ["primary", "supporting"].includes(data.role)
-    && ["Sum", "Average", "Maximum", "Minimum", "Count"].includes(data.stat);
-  const rows = conditionValues().filter(row => row.condition || row.threshold || row.kind || row.namespace);
-  return shared && rows.length > 0 && rows.every(conditionReady);
-}
-if (workload && populate) {
-  const refreshPopulate = () => { populate.disabled = !catalogReady(); };
-  workload.addEventListener("input", refreshPopulate);
-  workload.addEventListener("change", refreshPopulate);
-  const conditionRows = document.getElementById("condition-rows");
-  if (conditionRows) {
-    conditionRows.addEventListener("input", refreshPopulate);
-    conditionRows.addEventListener("change", refreshPopulate);
-    conditionRows.addEventListener("click", event => {
-      const button = event.target.closest(".condition-add");
-      if (!button) return;
-      const source = conditionRows.querySelector(".condition-row");
-      if (!source) return;
-      const copy = source.cloneNode(true);
-      copy.querySelectorAll("input").forEach(input => { input.value = ""; });
-      copy.querySelectorAll("select").forEach(select => { select.selectedIndex = 0; });
-      conditionRows.appendChild(copy);
-      refreshPopulate();
-    });
-  }
-  const conditionsOpen = document.getElementById("conditions-open");
-  const conditionsOverlay = document.getElementById("conditions-overlay");
-  if (conditionsOpen && conditionsOverlay) {
-    conditionsOpen.addEventListener("click", () => { conditionsOverlay.hidden = false; });
-    document.getElementById("conditions-close").addEventListener("click", () => { conditionsOverlay.hidden = true; });
-  }
-  populate.addEventListener("click", async () => {
-    if (!catalogReady()) return;
-    populate.disabled = true;
-    const data = Object.fromEntries(new FormData(workload));
-    data.conditions = conditionValues().filter(row => row.condition || row.threshold || row.kind || row.namespace);
-    const response = await fetch("/api/catalog", {
-      method: "POST",
-      headers: {"Content-Type": "application/json"},
-      body: JSON.stringify(data),
-    });
-    const body = await response.json().catch(() => ({}));
-    const result = document.getElementById("catalog-result");
-    if (result) result.textContent = body.message || body.error || "";
-    refreshPopulate();
-  });
 }
 """
 
@@ -1636,23 +2465,17 @@ def _verify_overlay() -> str:
 """
 
 
+def _address_options(addresses: list[str]) -> str:
+    if not addresses:
+        return '<option value="">No addresses are saved</option>'
+    return "".join(
+        f'<option value="{html.escape(item, quote=True)}">{html.escape(item)}</option>'
+        for item in addresses
+    )
+
+
 def render(demo: Demo) -> str:
     banner_class, banner = _banner(demo)
-    directory = next(
-        (row for row in demo.rows if row["name"] == DIRECTORY and row["resource_type"] == "lambda:function"),
-        None,
-    )
-    if directory is None:
-        directory_health = "not in this inventory"
-        directory_code = ""
-    else:
-        directory_health = shown_health(directory["health"])
-        directory_code = directory["problem_code"]
-    issue = demo.directory_issue_key
-    issue_html = html.escape(issue) if issue else "None yet. Break the directory records it."
-    issue_url = _browse(issue)
-    if issue and issue_url:
-        issue_html = f'<a href="{html.escape(issue_url)}">{html.escape(issue)}</a>'
     catalog_link = _confluence_url()
     page_id = get("CONFLUENCE_PAGE_ID")
     page_name = html.escape(f"Confluence page {page_id}" if page_id else "the Confluence page")
@@ -1664,25 +2487,15 @@ def render(demo: Demo) -> str:
     groups = inventory_groups(demo.rows)
     groups_html = _groups_html(groups)
     workload_count = sum(len(group["rows"]) for group in groups)
+    visible_notes = _shown_scan_notes(demo.scan_notes)
     notes = ""
-    if demo.scan_notes:
-        items = "".join(f"<li>{html.escape(note)}</li>" for note in demo.scan_notes)
-        notes = f"<div class='notes'><strong>Scan problems</strong><ul>{items}</ul></div>"
-    directory_result = html.escape(demo.directory_note) if demo.directory_note else "The issue key appears here after you press Break the directory."
+    if visible_notes:
+        items = "".join(f"<li>{html.escape(note)}</li>" for note in visible_notes)
+        notes = f"<div class='notes'><strong>Scan notes</strong><ul>{items}</ul></div>"
     scanned = html.escape(demo.scanned_at) if demo.scanned_at else "not completed"
-    saved_emails = html.escape("\n".join(load_recipients()))
+    saved_emails = _address_options(load_recipients())
     catalog_state = html.escape(demo.catalog_status)
-    page_link = _confluence_url()
-    prompt = "Nothing is written until you press Populate. Please check the changes at: "
-    if demo.catalog_note:
-        catalog_result = html.escape(demo.catalog_note)
-    elif page_link:
-        catalog_result = (
-            html.escape(prompt)
-            + f'<a href="{html.escape(page_link)}">{html.escape(page_link)}</a>'
-        )
-    else:
-        catalog_result = html.escape(prompt)
+    catalog_body = _catalog_view_html(demo.catalog_sections, demo.catalog_read_error)
     console = _aws_console_url()
     sites = (
         f'<p><a href="{html.escape(console, quote=True)}">{html.escape(console)}</a></p>'
@@ -1715,80 +2528,38 @@ def render(demo: Demo) -> str:
   </section>
   <section class="panel" id="panel-confluence">
     <h2>Confluence</h2>
+    <p class="meta">Monitored services on the catalog page. Open a service to see its metrics and why each one is there. This view does not add or edit them.</p>
     <p>{catalog_html}</p>
-    <form id="workload-form" class="form-grid">
-      <label>Service name<span class="hint">for example EKS</span><input name="service" autocomplete="off"></label>
-      <label>Resource type<span class="hint">for example eks:cluster</span><input name="resource_type" autocomplete="off"></label>
-      <label>Symptom id<span class="hint">optional; generated from the service name if blank</span><input name="symptom_id" autocomplete="off"></label>
-      <label>What to measure<span class="hint">metric name or log query</span><input name="measure" autocomplete="off"></label>
-      <div class="measure-line">
-        <label>Dimension<span class="hint">Name=Value, placeholders in braces allowed</span><input name="dimension" autocomplete="off"></label>
-        <label>Stat
-          <select name="stat">
-            <option value=""></option>
-            <option>Sum</option>
-            <option>Average</option>
-            <option>Maximum</option>
-            <option>Minimum</option>
-            <option>Count</option>
-          </select>
-        </label>
-        <label>Window in minutes<input name="window" inputmode="numeric" autocomplete="off"></label>
-        <label>Role
-          <select name="role">
-            <option value=""></option>
-            <option value="primary">primary</option>
-            <option value="supporting">supporting</option>
-          </select>
-        </label>
-      </div>
-    </form>
-    <p><button type="button" id="conditions-open">Add</button></p>
-    <p><button type="button" id="populate" disabled>Populate</button></p>
-    <p id="catalog-result" class="result">{catalog_result}</p>
+    {catalog_body}
   </section>
 </main>
 <footer>
   <section>
-    <h2>Let me test how this works</h2>
-    <p><button type="button" id="test-tool">Let me test how this works</button></p>
-    <p class="meta">Break and restore stay in that popup. Nothing changes until Verify and apply.</p>
-  </section>
-  <section>
     <h2>Mail</h2>
-    <label for="mail-addresses">Send results to these addresses</label>
-    <textarea id="mail-addresses" name="mail-addresses">{saved_emails}</textarea>
-    <p><button type="button" id="save-emails">Save addresses</button></p>
-    <p class="meta" id="ses-note">Amazon SES sends from the verified From address in the local config. In the sandbox, each recipient must be verified too.</p>
+    <label for="saved-addresses">Saved addresses</label>
+    <select id="saved-addresses">{saved_emails}</select>
+    <label for="new-address">Add an address</label>
+    <input id="new-address" name="new-address" type="text" autocomplete="off">
+    <p>
+      <button type="button" id="save-emails">Add address</button>
+      <button type="button" id="verify-email">Verify address</button>
+      <button type="button" id="delete-email">Delete address</button>
+    </p>
+    <p class="meta" id="ses-note">Each added address must be verified with Amazon before mail can arrive. An empty list does not send.</p>
     <p id="email-status" class="meta"></p>
   </section>
 </footer>
-<div id="conditions-overlay" hidden>
-  <div class="popup" role="dialog" aria-modal="true" aria-labelledby="conditions-title">
-    <h2 id="conditions-title">Conditions</h2>
-    <div id="condition-rows">
-      <div class="condition-row">
-        <label>Condition
-          <select data-field="condition">
-            <option value=""></option>
-            <option value=">">&gt;</option>
-            <option value=">=">&gt;=</option>
-            <option value="<">&lt;</option>
-          </select>
-        </label>
-        <label>Threshold<input data-field="threshold" autocomplete="off"></label>
-        <label>Type
-          <select data-field="kind">
-            <option value=""></option>
-            <option value="metric">metric</option>
-            <option value="log">log</option>
-          </select>
-        </label>
-        <label>Namespace or log group<input data-field="namespace" autocomplete="off"></label>
-        <button type="button" class="condition-add">Add</button>
-      </div>
+<div id="mail-verify-overlay" hidden>
+  <div class="popup" role="dialog" aria-modal="true" aria-labelledby="mail-verify-title">
+    <h2 id="mail-verify-title">Verify this address</h2>
+    <p id="mail-verify-address"></p>
+    <p>Amazon sends a message to this address. Open it and click the verification link. Mail cannot be delivered until Amazon marks the address verified.</p>
+    <p class="result" id="mail-verify-note"></p>
+    <div class="popup-actions">
+      <button type="button" id="mail-verify-close" class="quiet">Close</button>
+      <button type="button" id="mail-verify-send" class="quiet">Send verification email</button>
+      <button type="button" id="mail-verify-check">Check verification</button>
     </div>
-    <div class="popup-actions"><button type="button" id="conditions-close" class="quiet">Close</button></div>
   </div>
 </div>
 <div id="facts-overlay" hidden>
@@ -1803,34 +2574,23 @@ def render(demo: Demo) -> str:
     <div class="popup-actions"><button type="button" id="facts-close" class="quiet">Close</button></div>
   </div>
 </div>
-<div id="test-overlay" hidden>
-  <div class="popup" role="dialog" aria-modal="true" aria-labelledby="test-title">
-    <h2 id="test-title">Let me test how this works</h2>
-    <p>Directory health now: <strong>{html.escape(directory_health)}</strong>. Problem code: {html.escape(directory_code) or "none"}.</p>
-    <p>Directory issue in this inventory: {issue_html}</p>
-    <p class="meta">These buttons are not on the main page. Each one opens the action list, and nothing changes until you press Verify and apply.</p>
-    <div class="popup-actions" style="justify-content: flex-start; flex-wrap: wrap; margin: 16px 0;">
-      <button type="button" data-plan="break">Break the directory</button>
-      <button type="button" class="quiet" data-plan="restore">Restore the directory</button>
-    </div>
-    <p class="meta">Break points enterprise-sites-directory at a missing table, calls the sites URL, and runs inventory. Restore sets TABLE_NAME to enterprise-sites.</p>
-    <div class="result" id="directory-note">{directory_result}</div>
-    <div class="popup-actions">
-      <button type="button" id="test-close" class="quiet">Close</button>
-    </div>
-  </div>
-</div>
 {_verify_overlay()}
 """
     return _page("SRE health checker", body)
 
 
 def render_jira(demo: Demo) -> str:
-    banner_class, banner = _banner(demo)
     issue_views, jira_error = demo.issues_for_page()
+    if not issue_views and not jira_error:
+        _clear_stale_directory_failure(demo)
+    banner_class, banner = _banner(demo)
+    shown = []
     for view in issue_views:
-        view["note"] = demo.ticket_notes.get(view.get("key") or "", "")
-    cards = _issue_cards(issue_views, jira_error)
+        linked = _linked_issue(view, demo.rows)
+        linked["proposed"] = resolved_proposal(linked, str(linked.get("proposed") or ""))
+        linked["note"] = demo.ticket_notes.get(linked.get("key") or "", "")
+        shown.append(linked)
+    cards = _issue_cards(shown, jira_error)
     body = f"""
 <header class="page-head">
   <div class="brand">
@@ -1872,7 +2632,7 @@ def make_handler(demo: Demo):
         def do_GET(self) -> None:
             path = self.path.split("?", 1)[0]
             if path == "/":
-                demo.ensure_fresh()
+                demo.open_health()
                 page = render(demo).encode("utf-8")
                 self._send(200, page, "text/html; charset=utf-8")
                 return
@@ -1897,22 +2657,21 @@ def make_handler(demo: Demo):
             path = self.path.split("?", 1)[0]
             payload = self._read_json()
             if path == "/api/emails":
-                saved = save_recipients(str(payload.get("addresses") or ""))
+                if str(payload.get("verify") or "").strip():
+                    saved = _mail_with_login(lambda: confirm_verification(str(payload.get("verify") or "")))
+                elif str(payload.get("check") or "").strip():
+                    saved = _mail_with_login(lambda: verification_status(str(payload.get("check") or "")))
+                elif str(payload.get("delete") or "").strip():
+                    saved = delete_recipient(str(payload.get("delete") or ""))
+                elif str(payload.get("address") or "").strip():
+                    saved = add_recipient(str(payload.get("address") or ""))
+                else:
+                    saved = save_recipients(str(payload.get("addresses") or ""))
                 self._send(200 if saved["ok"] else 400, json.dumps(saved).encode("utf-8"), "application/json")
                 return
             if path == "/api/catalog":
-                if not demo.try_begin():
-                    self._send(409, json.dumps({"ok": False, "message": "Another action is still running."}).encode("utf-8"), "application/json")
-                    return
-                try:
-                    demo.populate_workload(payload)
-                except Exception as exc:
-                    demo.fail(exc)
-                    body = json.dumps({"ok": False, "message": demo.error}).encode("utf-8")
-                    self._send(400, body, "application/json")
-                    return
-                body = json.dumps({"ok": True, "message": demo.message}).encode("utf-8")
-                self._send(200, body, "application/json")
+                body = json.dumps({"ok": False, "message": "This page does not change Confluence."}).encode("utf-8")
+                self._send(400, body, "application/json")
                 return
             action_name = str(payload.get("action") or legacy.get(path) or "")
             if path not in {"/api/plan", "/api/verify"} and path not in legacy:
@@ -1934,6 +2693,11 @@ def make_handler(demo: Demo):
                 plan["ok"] = True
                 plan["applied"] = False
                 self._send(200, json.dumps(plan).encode("utf-8"), "application/json")
+                return
+            if action_name == "ticket" and plan.get("will_run") is False:
+                message = plan.get("lead") or "This issue has no correction this page can run."
+                body = json.dumps({"ok": True, "applied": False, "message": message, "mail": ""}).encode("utf-8")
+                self._send(200, body, "application/json")
                 return
             if action_name == "ticket":
                 mutator = lambda: demo.take_issue(str(payload.get("issue") or ""), str(payload.get("proposed") or ""))
@@ -2003,7 +2767,6 @@ def main() -> int:
             demo.phase = demo.message + " " + demo.error
             demo._busy = False
         print(demo.phase, flush=True)
-        print("Run aws login, then start this server again.", flush=True)
     server = None
     last_bind_error = "port busy"
     for _ in range(30):

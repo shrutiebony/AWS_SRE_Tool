@@ -225,6 +225,9 @@ def relationships_for_detail(item: dict) -> tuple[str, list[Relationship]]:
             target = mapping.get("event_source_arn")
             if not target:
                 continue
+            # A disabled mapping is not a consumer. The queue then has no consumes relationship.
+            if str(mapping.get("state") or "").lower() in {"disabled", "disabling", "deleting"}:
+                continue
             relationships.append(
                 Relationship(
                     source_id=item["resource_id"],

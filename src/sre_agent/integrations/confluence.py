@@ -352,6 +352,70 @@ def _clean(value: str) -> str:
     return html.unescape(re.sub(r"\s+", " ", text)).strip()
 
 
+_VIEW_FIELDS = (
+    ("symptom", "Symptom ID"),
+    ("measure", "Metric / query"),
+    ("condition", "Condition"),
+    ("threshold", "Threshold"),
+    ("status", "Status"),
+    ("kind", "Type"),
+    ("role", "Role"),
+)
+
+
+def catalog_sections(storage: str) -> list[dict]:
+    """Service headings and symptom rows already stored on the page.
+
+    This only reads storage. It does not validate placeholders or write the page.
+    Empty fields, unresolved placeholders, and scan errors are left out.
+    """
+    sections: list[dict] = []
+    current: dict | None = None
+    pattern = re.compile(r"<h2\b[^>]*>(.*?)</h2>|<table\b[^>]*>(.*?)</table>", re.IGNORECASE | re.DOTALL)
+    for heading, table in pattern.findall(storage or ""):
+        if heading:
+            text = _clean(heading)
+            if text.lower().startswith("service:") and not _hidden_catalog_text(text):
+                current = {"heading": text, "rows": []}
+                sections.append(current)
+            else:
+                current = None
+            continue
+        if current is None:
+            continue
+        parsed = _rows(table)
+        if len(parsed) < 2:
+            continue
+        header = [_clean(cell) for cell in parsed[0]]
+        needed = ("Symptom ID", "Metric / query", "Condition", "Threshold", "Status")
+        if not all(name in header for name in needed):
+            continue
+        index = {name: header.index(name) for name in header}
+        for raw in parsed[1:]:
+            values = {name: _clean(raw[position]) if position < len(raw) else "" for name, position in index.items()}
+            row = _visible_symptom(values)
+            if row:
+                current["rows"].append(row)
+    return sections
+
+
+def _visible_symptom(values: dict) -> dict:
+    shown = {}
+    for key, column in _VIEW_FIELDS:
+        text = str(values.get(column) or "").strip()
+        if not text or _hidden_catalog_text(text):
+            continue
+        shown[key] = text
+    if "symptom" not in shown:
+        return {}
+    return shown
+
+
+def _hidden_catalog_text(text: str) -> bool:
+    lowered = text.lower()
+    return "${" in text or "was not evaluated" in lowered or "resourcenotfoundexception" in lowered
+
+
 def _fill(template: str, values: dict[str, str]) -> str:
     def replace(match: re.Match) -> str:
         key = match.group(1)
